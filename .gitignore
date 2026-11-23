@@ -1,0 +1,7 @@
+wifi_secrets.h
+wifi
+build/
+build.log
+*.bin
+*.elf
+__pycache__/
