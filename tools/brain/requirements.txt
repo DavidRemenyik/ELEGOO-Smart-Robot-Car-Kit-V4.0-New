@@ -1,2 +1,4 @@
 pyserial
 esptool
+livekit-agents[google]~=1.8
+pillow
