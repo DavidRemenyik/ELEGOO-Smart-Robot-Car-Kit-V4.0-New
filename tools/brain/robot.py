@@ -149,4 +149,4 @@ class Robot:
         return tuple(int(self._request({"N": 22, "D1": i})) for i in range(3))
 
     def on_ground(self):
-        return self._request({"N": 23}) == "true"
+        return self._request({"N": 23}) == "false"  # N=23 answers "has the car left the ground?"
