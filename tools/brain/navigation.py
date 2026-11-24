@@ -14,8 +14,11 @@ Depth Pro 2 is under Apple's research-only licence; observation_spec.md names De
 Test only: CAR_TEST_DEPTH_URL, a 127.0.0.1 URL of the stand-in's /depth (sim/macsim/standin.py
 --test-depth), replaces realdepth with the simulator's own corrupted depth observation.
 
-CAR_NAV_DRIVER: hand (default) | policy | policy_veto, see .omo/waves/p3/policy-nav.md (the learned policy is
-faster but touched things 4.5 times as often per metre).
+CAR_NAV_DRIVER: hand (default) | policy_v2_veto | policy_v2 | policy | policy_veto. Through this go_to path against
+the building stand-in (43 trips from home, same seeds, 2026-11-24; .omo/waves/p3/goto/trips-{hand2,v2veto}.jsonl)
+hand arrived 35 with 0.42 contacts per trip in a median 66 s, policy_v2_veto 34 with 0.98 in 85 s, no false
+arrivals either way. The navigator-only room-prior test (retrain.md) had favoured policy_v2_veto (86 vs 77 %).
+The owner chose hand on that evidence.
 """
 
 import io
