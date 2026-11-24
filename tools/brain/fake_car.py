@@ -110,6 +110,8 @@ class Car:
         self.lifted = False
         self.drop_until = 0.0
         self.zero_at = 0.0
+        self.barrier = None  # x0, y0, x1, y1: stops the car, but neither the range sensor nor the camera sees it
+        self.view = None  # "blank" (a plain surface fills the view) or "dark" replaces the rendered picture
 
     def _set_wheels(self, left, right, source):
         if (self.left or self.right) and not (left or right):
@@ -130,7 +132,8 @@ class Car:
                 nx, ny = self.x + v * math.cos(a) * dt, self.y + v * math.sin(a) * dt
                 if self.lifted or blocked(nx, ny) or (
                     self.person and math.hypot(nx - self.person[0], ny - self.person[1]) < PERSON_RADIUS + CAR_RADIUS
-                ):
+                ) or (self.barrier and self.barrier[0] - CAR_RADIUS < nx < self.barrier[2] + CAR_RADIUS
+                      and self.barrier[1] - CAR_RADIUS < ny < self.barrier[3] + CAR_RADIUS):
                     self.bumped = True
                 else:
                     self.x, self.y = nx, ny
@@ -149,8 +152,8 @@ class Car:
         with self.lock:
             self._advance()
             return dict(x=self.x, y=self.y, heading=self.heading, head=self.head, left=self.left,
-                        right=self.right, person=self.person, lifted=self.lifted,
-                        zero_at=self.zero_at, now=time.monotonic())
+                        right=self.right, person=self.person, lifted=self.lifted, barrier=self.barrier,
+                        view=self.view, zero_at=self.zero_at, now=time.monotonic())
 
     def handle(self, msg):
         """Apply one command; returns the reply body."""
@@ -203,6 +206,12 @@ class Car:
 
 def render(car):
     scene = car.test_state()
+    if scene["view"]:
+        level = 8 if scene["view"] == "dark" else 150
+        noise = Image.effect_noise((W, H), 3).point(lambda v: max(0, min(255, level + (v - 128))))
+        out = io.BytesIO()
+        noise.convert("RGB").save(out, "JPEG", quality=80)
+        return out.getvalue(), ""
     x, y, heading, head = (scene[k] for k in ("x", "y", "heading", "head"))
     view = math.radians(heading + head - CENTER)
     img = Image.new("RGB", (W, H), CEILING_COLOR)
@@ -283,8 +292,18 @@ def camera_server(car, port, test_controls):
                 if not 0 < size <= 1024:
                     raise ValueError("wrong request size")
                 data = json.loads(self.rfile.read(size))
-                if not isinstance(data, dict) or not data or data.keys() - {"person", "lifted", "drop_link", "pose"}:
+                if not isinstance(data, dict) or not data or data.keys() - {
+                    "person", "lifted", "drop_link", "pose", "barrier", "view"
+                }:
                     raise ValueError("unknown test command")
+                barrier = data.get("barrier")
+                if barrier is not None:
+                    x0, y0, x1, y1 = map(float, barrier)
+                    if not (x0 < x1 and y0 < y1):
+                        raise ValueError("barrier needs x0 < x1 and y0 < y1")
+                    barrier = (x0, y0, x1, y1)
+                if data.get("view") not in (None, "blank", "dark"):
+                    raise ValueError("view is blank, dark or null")
                 pose = None
                 if "pose" in data:
                     values = data["pose"]
@@ -315,6 +334,10 @@ def camera_server(car, port, test_controls):
                         car.lifted = data["lifted"] is True
                     if data.get("drop_link") is True:
                         car.drop_until = time.monotonic() + 1
+                    if "barrier" in data:
+                        car.barrier = barrier
+                    if "view" in data:
+                        car.view = data["view"]
                     log(f"FIXTURE {data} monotonic={time.monotonic():.6f}")
                 self._state()
             except (KeyError, OverflowError, TypeError, ValueError):

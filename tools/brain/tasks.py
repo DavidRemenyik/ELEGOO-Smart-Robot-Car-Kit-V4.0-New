@@ -20,7 +20,7 @@ from livekit.agents import ToolError
 from pydantic import BaseModel, Field, ValidationError
 
 from dashboard import Recorder
-from drive import MOVE_LIMIT, NO_FLOOR, Driver, _speed
+from drive import MOVE_LIMIT, NO_FLOOR, STALL_BACK_CM, STALLED, Driver, StallWatch, _speed, distance_at
 from vision import Person, Vision, person_box
 
 log = logging.getLogger("car-agent")
@@ -40,14 +40,16 @@ def clamp(x: float, lo: float, hi: float) -> float:
 class SafeDrive:
     """Wrap the existing recorder without changing Driver or the wire protocol."""
 
-    def __init__(self, robot: Recorder, reason: Callable[[], str | None]):
+    def __init__(self, robot: Recorder, reason: Callable[[], str | None], vision: Vision | None = None):
         self.robot, self.reason = robot, reason
         self.head_angle = 90
         self.last_floor = 0.0
         self._pwm = (0.0, 0.0)
         self._wheel_at = time.monotonic()
         self.distance_driven = 0.0
+        self._odometer: deque[tuple[float, float]] = deque(maxlen=200)
         self.vote_while_driving = False
+        self.stall = StallWatch(vision)  # every wheel command goes through here, so this feeds it
 
     def check(self) -> None:
         if reason := self.reason():
@@ -82,9 +84,12 @@ class SafeDrive:
             0.4, now - self._wheel_at
         )
         self._pwm, self._wheel_at = (left, right), now
+        self._odometer.append((now, self.distance_driven))
         status = self.robot.wheels(left, right)
         if left or right:
             self._check_floor(status[1])
+        if self.stall.wheels(left, right, status[0], self.head_angle):
+            self.distance_driven = distance_at(self._odometer, self.stall.still_since)
         return status
 
     def head(self, angle: int) -> None:
@@ -99,7 +104,9 @@ class SafeDrive:
 
     def _range_sample(self) -> int:
         self.check()
-        return self.robot.distance()
+        cm = self.robot.distance()
+        self.stall.ranged(cm, self.head_angle)
+        return cm
 
     def range_vote(self) -> float:
         return median(self._range_sample() for _ in range(3))
@@ -123,6 +130,9 @@ def follow_person(r: SafeDrive, vision: Vision, target_cm: int) -> str:
     range_at = 0.0
     while (now := time.monotonic()) - start < 300:
         r.check()
+        if why := r.stall.stalled():
+            r.wheels(0, 0)
+            return f"I stopped following: {why}."
         frame = vision.latest()
         if not frame or frame.timestamp <= max(fresh_after, last_frame):
             if now - seen_at > 0.35:
@@ -195,9 +205,9 @@ def follow_person(r: SafeDrive, vision: Vision, target_cm: int) -> str:
     return "I reached the five minute follow limit and stopped."
 
 
-def open_heading(r: SafeDrive) -> tuple[int, float]:
+def open_heading(r: SafeDrive, angles: tuple[int, ...] = (90, 40, 140, 15, 165)) -> tuple[int, float]:
     readings = []
-    for angle in (90, 40, 140, 15, 165):
+    for angle in angles:
         r.head(angle)
         r.wait(0.18)
         readings.append((angle - 90, r.range_vote()))
@@ -206,11 +216,11 @@ def open_heading(r: SafeDrive) -> tuple[int, float]:
 
 
 def patrol(r: SafeDrive, vision: Vision, seconds: int) -> str:
-    """Roam like Driver.explore, with an independent sampler and no blind retreat."""
+    """Roam like Driver.explore, with an independent sampler; it backs up only off something it pushed against."""
     folder = PATROLS / datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     folder.mkdir(parents=True)
     begin = time.monotonic()
-    turns, saved = 0, 0
+    turns, saved, stalls = 0, 0, 0
     sightings: list[str] = []
     seen = Event()
     why = None
@@ -248,14 +258,20 @@ def patrol(r: SafeDrive, vision: Vision, seconds: int) -> str:
     original_reason = r.reason
     r.vote_while_driving = True
     r.reason = lambda: original_reason() or ("patrol time is up" if time.monotonic() >= deadline else None)
-    driver = Driver(r)
+    driver = Driver(r, stall=r.stall)
     try:
         while True:
             r.check()
             # A shallow wall can intersect the chassis while the forward beam still reads
             # clear. Stop between short legs and vote on both forward flanks before continuing.
             _, why = driver.forward(140, 35, max_s=min(2.8, deadline - time.monotonic()))
-            if why and why != MOVE_LIMIT:
+            if why == STALLED:
+                # The beam missed what the car is pushing against, so straight ahead is not an option.
+                stalls += 1
+                driver.back(STALL_BACK_CM)
+                angle, room = open_heading(r, (40, 140, 15, 165))
+                turn = angle if room > 50 else 160
+            elif why and why != MOVE_LIMIT:
                 angle, room = open_heading(r)
                 turn = angle if room > 50 and abs(angle) > 10 else 160
             else:
@@ -283,9 +299,10 @@ def patrol(r: SafeDrive, vision: Vision, seconds: int) -> str:
         r.reason = original_reason
     people = f"People seen: {', '.join(sightings)}." if sightings else "No people detected."
     ending = f" Ended early: {why}." if why and why != "patrol time is up" else ""
+    pushed = f" {stalls} times I was pushing against something and backed off." if stalls else ""
     return (
         f"Patrol: {time.monotonic() - begin:.0f} seconds, about {r.distance_driven:.0f} cm, "
-        f"{turns} direction changes. {people} {saved} pictures in patrols/{folder.name}/.{ending}"
+        f"{turns} direction changes. {people} {saved} pictures in patrols/{folder.name}/.{pushed}{ending}"
     )
 
 
@@ -327,7 +344,7 @@ def find_object(r: SafeDrive, vision: Vision, query: Callable[[bytes], Awaitable
     deadline = time.monotonic() + 150
     budget = 24
     initial_heading, _ = r.heading()
-    driver = Driver(r)
+    driver = Driver(r, stall=r.stall)
     r.vote_while_driving = True
     travel = 0.0
     failures = 0  # consecutive views the model gave no usable answer for
@@ -404,8 +421,10 @@ def find_object(r: SafeDrive, vision: Vision, query: Callable[[bytes], Awaitable
                                 f"I'm facing {abs(relative):.0f} degrees {'left' if relative >= 0 else 'right'} "
                                 f"of my starting heading after driving about {travel:.0f} cm."
                             )
-                        gone, _ = driver.forward(min(36, distance - 41), 40, max_s=2)
+                        gone, why = driver.forward(min(36, distance - 41), 40, max_s=2)
                         travel += gone
+                        if why == STALLED:
+                            return f"I can see {name}, but I stopped approaching: {why}."
                     return f"I can see {name}, but could not confirm a safe approach to 40 cm. I stopped."
             if heading_step < 3:
                 driver.turn(90, max_s=3)
@@ -415,8 +434,10 @@ def find_object(r: SafeDrive, vision: Vision, query: Callable[[bytes], Awaitable
                 break
             if angle:
                 driver.turn(angle, max_s=3)
-            gone, _ = driver.forward(min(100, space - 42), 40, max_s=3)
+            gone, why = driver.forward(min(100, space - 42), 40, max_s=3)
             travel += gone
+            if why == STALLED:
+                return f"I couldn't find {name} in the views I checked. I stopped: {why}."
     return f"I couldn't find {name} in the views I checked. I stopped."
 
 
@@ -513,7 +534,7 @@ class TaskManager:
             return self._blocked()
 
         def run(robot: Recorder) -> str:
-            r = SafeDrive(robot, reason)
+            r = SafeDrive(robot, reason, self.vision)
             try:
                 r.check()
                 return fn(r)
