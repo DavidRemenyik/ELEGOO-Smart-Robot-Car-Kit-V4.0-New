@@ -8,6 +8,7 @@ checks that the camera picture really changes while the wheels drive straight.
 
 import io
 import json
+import logging
 import statistics
 import time
 from collections import deque
@@ -18,6 +19,8 @@ from PIL import Image
 
 import behaviors
 from robot import MAX_RANGE_CM
+
+log = logging.getLogger("car-agent")
 
 CALIBRATION = Path(__file__).with_name("calibration.json")
 CRUISE = 150  # wheel PWM on a clear straight
@@ -126,14 +129,15 @@ class StallWatch:
     """Notices a straight drive that goes nowhere: two of picture, gyro and range say the car is not moving.
 
     The robot wrapper that sends the wheel commands feeds it (wheels() after each command, ranged() after
-    each range reading); drives read stalled(). Without camera frames it never reports a stall, so driving
-    is then exactly as without it.
+    each range reading); drives read stalled(). While the picture feed has no fresh frame, gyro and range
+    still vote. Its votes are logged once a second during straight drives.
     """
 
     def __init__(self, camera=None):
         self.camera = camera  # anything with newest(max_age) -> Frame | None, such as vision.Vision
         self.events = []  # (found at, still since) per stall, monotonic seconds
         self.signal = {}  # the latest raw values and votes, for logs
+        self._logged_at = 0.0
         self._clear()
 
     def _clear(self):
@@ -179,6 +183,10 @@ class StallWatch:
             return False
         votes = (self._picture_vote, self._gyro(heading), self._range())
         self.signal["votes"] = votes
+        if now - self._logged_at >= 1.0:
+            self._logged_at = now
+            log.info("stall votes picture/gyro/range %s, range spread %s closed %s, picture %s", votes,
+                     self.signal.get("spread"), self.signal.get("closed"), "fresh" if frame else "none")
         if not votes[2]:
             self._range_since = None
         elif self._range_since is None:

@@ -191,11 +191,15 @@ class Trip:
 
 
 def plan_trip(place: str, start_room: str | None, where: Whereabouts) -> Trip:
-    """Pick the goal and the start prior: a named room, else where the last trip arrived, else home.
+    """Pick the goal and the start prior: a named room, else where the last trip arrived, else home once the
+    owner has set it, else none (a cold start: the car finds itself first). Assuming the placeholder home made
+    the real car "arrive" home without moving and drive from a wrong, certain pose (2026-11-24).
 
     Raises UnknownPlace for names not in places.yaml, ValueError for goals the map cannot reach.
     """
     label, goal, _ = find_place(place)
+    if label == "home" and home().placeholder:
+        raise UnknownPlace("Home isn't set yet. Put me on my home spot and say 'this is home', then I can go back there.")
     if start_room:
         room, _, area = find_place(start_room)
         if room == "home":
@@ -204,9 +208,10 @@ def plan_trip(place: str, start_room: str | None, where: Whereabouts) -> Trip:
             return Trip(label, goal, Navigator(goal, area, driver=DRIVER), f"somewhere in the {room}")
     if not start_room and (pose := where.start_pose()):
         start, how = pose, "where my last trip ended"
+    elif (h := home()).placeholder:
+        return Trip(label, goal, Navigator(goal, driver=DRIVER), "an unknown spot, so I find myself first (home is not set)")
     else:
-        h = home()
-        start, how = (h.x, h.y, h.yaw), "home" + (" (a placeholder spot until home is set)" if h.placeholder else "")
+        start, how = (h.x, h.y, h.yaw), "home"
     return Trip(label, goal, Navigator(goal, start_pose=start, driver=DRIVER), how)
 
 
