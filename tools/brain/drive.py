@@ -164,16 +164,15 @@ class StallWatch:
         if self.still_since is not None or self.camera is None:
             return False
         frame = self.camera.newest(STALL_FRAME_AGE_S)
-        if frame is None:  # the camera has stalled or is off: no judgement until it is back
+        if frame is None:  # the picture feed has stalled (it does on the real car): gyro and range still vote
             self._pictures.clear()
-            self._picture_vote, self._picture_since, self._range_since = None, None, None
-            return False
+            self._picture_vote, self._picture_since = None, None
         self._commands.append((now, heading, (right - left) / 2))
         while len(self._commands) > 1 and self._commands[1][0] <= now - STALL_WINDOW_S:
             self._commands.popleft()
         while self._ranges and self._ranges[0][0] < now - STALL_WINDOW_S:
             self._ranges.popleft()
-        if frame.timestamp > self._newest and frame.timestamp >= self._began:
+        if frame is not None and frame.timestamp > self._newest and frame.timestamp >= self._began:
             self._newest = frame.timestamp
             self._look(picture(frame.jpeg), frame.timestamp, heading + head)
         if now - self._began < STALL_WINDOW_S:

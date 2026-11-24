@@ -487,7 +487,12 @@ def go_to(r: SafeDrive, vision: Vision, trip: navigation.Trip, where: navigation
         due = time.monotonic()
         while True:
             stamps.append(time.monotonic())
-            left, right, head, status = nav.step(sensors.observe())
+            obs = sensors.observe()
+            left, right, head, status = nav.step(obs)
+            if len(stamps) % 10 == 1:  # once a second: what the navigator believes and what it got
+                log.info("nav: %s | depth %s range %s map_fit %.2f cmd %d,%d stalls %d votes %s", status.line(),
+                         "yes" if obs.depth is not None else "NO", obs.range_cm, status.map_fit, left, right, stalls,
+                         r.stall.signal.get("votes"))
             computed = time.monotonic()
             compute_ms.append((computed - stamps[-1]) * 1000)
             where.update(status.pose, status.confidence, trip.doing)
