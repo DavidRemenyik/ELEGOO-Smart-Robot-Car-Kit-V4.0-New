@@ -78,7 +78,11 @@ public:
     void processCarControlTimeLimit(uint8_t direction, uint8_t speed, unsigned long duration);
     
     // Process individual motor speed control / 处理单独的电机速度控制
-    void processMotorSpeedControl(uint8_t leftSpeed, uint8_t rightSpeed);
+    // Signed speeds, -255..255; negative runs that side backward / 有符号速度，负值为后退
+    void processMotorSpeedControl(int16_t leftSpeed, int16_t rightSpeed);
+
+    // Reply "<yaw in 0.1 deg>,<1 on ground | 0 lifted>" / 回复偏航角和着地状态
+    void sendDriveStatus();
     
     // Clear all functions and set new state / 清除所有功能并设置新状态
     void clearAllFunctions(State newState);
@@ -158,6 +162,14 @@ private:
     bool isOnGround = true;
     bool voltageDetectionStatus = false;
     bool isIrRobotControl = false;
+
+    /// Gyro yaw, integrated every sensor update / 陀螺仪偏航角
+    bool mpuReady = false;
+    float yaw = 0;
+
+    /// Wheel-speed commands (N=4) stop by themselves when the sender goes quiet / 轮速命令超时自动停止
+    bool wheelsActive = false;
+    unsigned long wheelCommandTime = 0;
     
     /// Movement direction / 运动方向
     CarDirection carDirection;
@@ -182,6 +194,9 @@ public:
     
     /// Line tracking detection threshold / 循迹检测阈值
     static constexpr uint16_t TRACKING_DETECTION_THRESHOLD = 950;
+
+    /// Wheel-speed command lifetime (ms) / 轮速命令有效期 (毫秒)
+    static constexpr uint16_t WHEEL_COMMAND_TIMEOUT_MS = 400;
 };
 
 /// Global application function set instance

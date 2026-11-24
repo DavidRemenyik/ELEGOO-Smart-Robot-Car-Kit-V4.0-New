@@ -54,12 +54,12 @@ void DeviceDriverSet_MPU6050::getEulerAngles(float *Yaw)
   dt = (now - lastTime) / 1000.0;         //Caculate the derivative time(s) / 计算微分时间(s)
   lastTime = now;                         //Record the last sampling time(ms) / 记录最后一次采样时间(ms)
   gz = accelgyro.getRotationZ();          //Read the raw values of the six axes / 读取六轴原始值
-  float gyroz = -(gz - gzo) / 131.0 * dt; //z-axis angular velocity / Z 轴角速度
-  if (fabs(gyroz) < 0.05)                 //Clear instant zero drift signal / 清除瞬时零漂信号
+  float rate = -(gz - gzo) / 131.0;       //z-axis angular velocity (deg/s) / Z 轴角速度
+  if (fabs(rate) < 1.0)                   //Clear zero drift; a rate threshold, so it does not grow when sampled faster / 清除零漂信号
   {
-    gyroz = 0.00;
+    rate = 0.00;
   }
-  agz += gyroz; //z-axis angular velocity integral / Z 轴角速度积分
+  agz += rate * dt; //z-axis angular velocity integral / Z 轴角速度积分
   *Yaw = agz;
 }
 

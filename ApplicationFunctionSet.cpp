@@ -47,6 +47,7 @@ void ApplicationFunctionSet::init() {
         Serial.println("MPU6050 initialization failed!");
     } else {
         AppMPU6050.calibration();
+        mpuReady = true;
     }
     
     // Initialize motor state / 初始化电机状态
@@ -83,6 +84,11 @@ void ApplicationFunctionSet::checkState() {
     // Update servo state machine / 更新舵机状态机
     AppServo.update();
 
+    // Wheel-speed commands expire, so a lost link cannot leave the car driving / 轮速命令超时停止
+    if (wheelsActive && millis() - wheelCommandTime > WHEEL_COMMAND_TIMEOUT_MS) {
+        processMotorSpeedControl(0, 0);
+    }
+
     // Execute current state function / 执行当前状态功能
     switch (currentState) {
         case State::Standby:
@@ -117,6 +123,10 @@ void ApplicationFunctionSet::updateSensorData() {
         return;
     }
     lastUpdate = currentTime;
+
+    if (mpuReady) {
+        AppMPU6050.getEulerAngles(&yaw);
+    }
 
     // Update battery voltage status / 更新电池电压状态
     noInterrupts();
@@ -338,11 +348,9 @@ void ApplicationFunctionSet::analyzeSerialData(const JsonDocument &doc) {
             break;
         case 4: // Individual motor speed control / 独立电机速度控制
             {
-                uint8_t leftSpeed = doc["D1"].as<uint8_t>();
-                uint8_t rightSpeed = doc["D2"].as<uint8_t>();
                 currentState = State::DoNothing;
-                processMotorSpeedControl(leftSpeed, rightSpeed);
-                sendCommandResponse(true);
+                processMotorSpeedControl(doc["D1"].as<int16_t>(), doc["D2"].as<int16_t>());
+                sendDriveStatus();
             }
             break;
         case 5: // Servo control / 舵机控制
@@ -374,6 +382,9 @@ void ApplicationFunctionSet::analyzeSerialData(const JsonDocument &doc) {
                 currentState = State::DoNothing;
                 sendResponseData(isOnGround ? "false" : "true");
             }
+            break;
+        case 24: // Yaw and ground status / 偏航角和着地状态
+            sendDriveStatus();
             break;
         case 100: // Clear all functions - standby / 清除所有功能 - 待机
             {
@@ -433,6 +444,7 @@ void ApplicationFunctionSet::processMotorControl(const JsonDocument &doc) {
     uint8_t motorDirection = doc["D3"].as<uint8_t>();
     
     currentState = State::DoNothing;
+    wheelsActive = false;
 
     // Stop all motors if direction is 0 / 如果方向为 0，停止所有电机
     if (motorDirection == 0) {
@@ -477,22 +489,15 @@ void ApplicationFunctionSet::processMotorControl(const JsonDocument &doc) {
     sendCommandResponse(true);
 }
 
-void ApplicationFunctionSet::processMotorSpeedControl(uint8_t leftSpeed, uint8_t rightSpeed) {
-    // Update motor state / 更新电机状态
-    motorState.speedRight = rightSpeed;
-    motorState.speedLeft = leftSpeed;
-    
-    if (leftSpeed == 0 && rightSpeed == 0) {
-        // Both motors stopped - use existing directions / 两个电机停止 - 使用现有方向
-        AppMotor.control(motorState.directionRight, motorState.speedRight, 
-                        motorState.directionLeft, motorState.speedLeft);
-    } else {
-        // Motors running - assume forward direction for both / 电机运行 - 假设两个都为前进方向
-        motorState.directionRight = true;
-        motorState.directionLeft = true;
-        AppMotor.control(motorState.directionRight, motorState.speedRight, 
-                        motorState.directionLeft, motorState.speedLeft);
-    }
+void ApplicationFunctionSet::processMotorSpeedControl(int16_t leftSpeed, int16_t rightSpeed) {
+    motorState.directionRight = rightSpeed >= 0;
+    motorState.speedRight = min(abs(rightSpeed), 255);
+    motorState.directionLeft = leftSpeed >= 0;
+    motorState.speedLeft = min(abs(leftSpeed), 255);
+    wheelsActive = leftSpeed != 0 || rightSpeed != 0;
+    wheelCommandTime = millis();
+    AppMotor.control(motorState.directionRight, motorState.speedRight, 
+                    motorState.directionLeft, motorState.speedLeft);
 }
 
 void ApplicationFunctionSet::processCarControl(uint8_t direction, uint8_t speed) {
@@ -509,6 +514,7 @@ void ApplicationFunctionSet::processCarControl(uint8_t direction, uint8_t speed)
 
 void ApplicationFunctionSet::handleCarControlCommand(const JsonDocument &doc) {
     currentState = State::DoNothing;
+    wheelsActive = false;
     uint8_t direction = doc["D1"].as<uint8_t>();
     uint8_t speed = doc["D2"].as<uint8_t>();
     
@@ -582,6 +588,7 @@ void ApplicationFunctionSet::clearAllFunctions(State newState) {
     motorState.speedRight = 0;
     motorState.directionLeft = true;
     motorState.speedLeft = 0;
+    wheelsActive = false;
     
     // Stop motors and clear LEDs / 停止电机并清除 LED
     motionControl.SmartRobotCarMotionControl(stop_it, 0);
@@ -611,6 +618,12 @@ void ApplicationFunctionSet::sendResponseData(const char* data) {
     Serial.write("_");
     Serial.write(data);
     Serial.write("}");
+}
+
+void ApplicationFunctionSet::sendDriveStatus() {
+    char status[16];
+    sprintf(status, "%ld,%d", (long)(yaw * 10), isOnGround ? 1 : 0);
+    sendResponseData(status);
 }
 
 // ========== Timer Functions / 定时器功能 ==========
