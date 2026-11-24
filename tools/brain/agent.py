@@ -1,4 +1,4 @@
-"""Talking, seeing robot: LiveKit Agents driving the car with an STT -> LLM -> TTS pipeline.
+"""Talking, seeing robot: LiveKit Agents driving the car with Gemini Live (or an STT -> LLM -> TTS pipeline).
 
 Run on the Mac (mic + speakers):  .venv/bin/python agent.py console
 Type instead of talking:          .venv/bin/python agent.py console --text
@@ -8,13 +8,21 @@ Without the car:                  .venv/bin/python fake_car.py --port 18100 --ca
                                   CAR_CAMERA_URL=http://127.0.0.1:18101/capture \
                                   CAR_STREAM_URL=http://127.0.0.1:18101/stream .venv/bin/python agent.py console --text
 
-Pipeline: ElevenLabs speech-to-text hears the mic, Gemini on Vertex AI (project from
-GOOGLE_CLOUD_PROJECT, default agrointel-dd8f6, via gcloud application-default credentials)
-reads the words plus a fresh car camera picture on every turn and picks the moves, and
-ElevenLabs speaks the reply (CAR_VOICE=google switches to Google Cloud TTS).
-The ElevenLabs key comes from ELEVENLABS_API_KEY / ELEVEN_API_KEY, else from Secret Manager
+Google Cloud: Vertex AI in project GOOGLE_CLOUD_PROJECT (default agrointel-dd8f6) via gcloud
+application-default credentials.
+
+CAR_VOICE=gemini-live (default): one realtime model (GEMINI_LIVE_MODEL, default gemini-3.8-live,
+in GEMINI_LIVE_LOCATION, default us-central1) hears the mic, watches the car camera (one frame a
+second, plus a fresh frame right after every move) and speaks with a Google voice (GEMINI_VOICE,
+default Zephyr). Fastest replies.
+
+CAR_VOICE=elevenlabs: ElevenLabs speech-to-text hears the mic, Gemini (GEMINI_MODEL in
+GEMINI_LOCATION) reads the words plus a fresh car camera picture on every turn and picks the moves,
+and ElevenLabs speaks the reply (ELEVEN_VOICE_ID, ELEVEN_MODEL). The ElevenLabs key comes from
+ELEVENLABS_API_KEY / ELEVEN_API_KEY, else from Secret Manager
 (gcloud secrets versions access latest --secret=ELEVENLABS_API_KEY); it is kept in memory only.
-Other settings: GEMINI_MODEL, GEMINI_LOCATION, ELEVEN_VOICE_ID, ELEVEN_MODEL.
+
+find_object always asks GEMINI_MODEL in GEMINI_LOCATION where the object is.
 
 Following a person and patrol sightings need the person detector (3.7 MB, once per venv):
   mkdir -p .venv/share/elegoo && curl -fsSL -o .venv/share/elegoo/yolox_nano.onnx \
@@ -28,6 +36,7 @@ something closer than STOP_CM.
 import asyncio
 import base64
 import functools
+import io
 import logging
 import os
 import subprocess
@@ -35,10 +44,13 @@ import threading
 import time
 from typing import Literal
 
-from livekit import agents
+from livekit import agents, rtc
 from livekit.agents import Agent, AgentServer, AgentSession, ToolError, function_tool
 from livekit.agents.llm import ImageContent
+from livekit.agents.voice.io import VideoInput
+from google.genai import types as genai
 from livekit.plugins import elevenlabs, google, silero
+from PIL import Image
 
 import behaviors
 from drive import Driver
@@ -55,10 +67,13 @@ DASHBOARD_PORT = int(os.environ.get("DASHBOARD_PORT", "8765"))
 PROJECT = os.environ.get("GOOGLE_CLOUD_PROJECT", "agrointel-dd8f6")
 MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
 LOCATION = os.environ.get("GEMINI_LOCATION", "global")  # gemini-3.8-flash is not served in us-central1 for this project
-CAR_VOICE = os.environ.get("CAR_VOICE", "elevenlabs")
+CAR_VOICE = os.environ.get("CAR_VOICE", "gemini-live")
+LIVE_MODEL = os.environ.get("GEMINI_LIVE_MODEL", "gemini-3.8-live")
+LIVE_LOCATION = os.environ.get("GEMINI_LIVE_LOCATION", "us-central1")  # Live is not served on "global"
+LIVE_VOICE = os.environ.get("GEMINI_VOICE", "Zephyr")  # Google's "bright" voice, closest to the ElevenLabs one
+LIVE_FPS = 1.0  # Gemini Live takes about one picture a second
 ELEVEN_VOICE_ID = os.environ.get("ELEVEN_VOICE_ID", "cgSgspJ2msm6clMCkdW9")  # premade "Jessica - Playful, Bright, Warm"
 ELEVEN_MODEL = os.environ.get("ELEVEN_MODEL", "eleven_flash_v2_5")  # ElevenLabs' ultra-low-latency model
-GOOGLE_VOICE = os.environ.get("GOOGLE_TTS_VOICE", "en-US-Chirp3-HD-Puck")
 CAMERA_FPS = 5.0  # refresh rate of the control pane's still frame
 SNAPSHOT_MAX_AGE_S = 3.0  # the model never gets a picture older than this; the real camera needs up to 2 s per picture
 SNAPSHOT_WAIT_S = 6.0  # how long a model turn waits for the camera before going on blind
@@ -69,14 +84,15 @@ SETTLE_S = 0.4  # let the car and the head come to rest before the model's next 
 MANUAL_SPEED = 150
 HUMAN_HOLD_S = 1.5  # after the human touches the controls, the agent keeps its wheels still this long
 RECONNECT_S = 3.0
+REPEAT_S = 3.0  # Gemini Live re-issues the move it just made; an identical move this soon is dropped once
 INITIATIVE = os.environ.get("CAR_INITIATIVE", "0") == "1"
 
 log = logging.getLogger("car-agent")
 
 INSTRUCTIONS = """You are Elegoo, a small, friendly four-wheeled robot car. You talk out loud in English,
 in short, natural sentences, with no markdown, lists or emoji, because everything you write is spoken.
-You see the world through a camera on your head: each time you think, you get a fresh picture of what
-it sees right now. The camera sits low, about 15 cm above the floor, and points up at about 20 degrees,
+You see the world through a camera on your head, and after every move or look you get a fresh picture
+of what it sees then. The camera sits low, about 15 cm above the floor, and points up at about 20 degrees,
 so you see ceilings, walls and the upper parts of things, people usually look tall and you may only see
 their legs, and the floor right in front of you is out of view: small things on the floor close by may
 not show, so trust the distance sensor and move reports for nearby obstacles.
@@ -119,10 +135,6 @@ def _eleven_key():
 
 
 def make_tts():
-    if CAR_VOICE == "google":
-        return google.TTS(voice_name=GOOGLE_VOICE, language="en-US")
-    if CAR_VOICE != "elevenlabs":
-        raise SystemExit(f"CAR_VOICE must be elevenlabs or google, not {CAR_VOICE!r}")
     return elevenlabs.TTS(voice_id=ELEVEN_VOICE_ID, model=ELEVEN_MODEL, api_key=_eleven_key())
 
 
@@ -134,6 +146,40 @@ def make_llm():
         model=MODEL,
         thinking_config={"thinking_level": "low"},  # less thinking, sooner first word; "minimal" is refused by this model
     )
+
+
+def make_session():
+    if CAR_VOICE == "gemini-live":
+        return AgentSession(
+            llm=google.realtime.RealtimeModel(
+                vertexai=True,
+                project=PROJECT,
+                location=LIVE_LOCATION,
+                model=LIVE_MODEL,
+                voice=LIVE_VOICE,
+                language="en-US",
+                # 3.8 Live defaults to NON_BLOCKING tools and then re-issued the same move up to 6 times
+                tool_behavior=genai.Behavior.BLOCKING,
+                realtime_input_config=genai.RealtimeInputConfig(
+                    automatic_activity_detection=genai.AutomaticActivityDetection(silence_duration_ms=int(ENDPOINT_MIN_S * 1000)),
+                ),
+                # Without compression Vertex ends an audio+video session after about 2 minutes; a small window keeps replies quick
+                context_window_compression=genai.ContextWindowCompressionConfig(
+                    trigger_tokens=32000, sliding_window=genai.SlidingWindow(target_tokens=16000),
+                ),
+                session_resumption=genai.SessionResumptionConfig(),  # reconnects every ~10 min keep the conversation
+            ),
+            video_sampler=None,  # LiveVideo paces the frames itself and must not lose the one after a move
+        )
+    if CAR_VOICE == "elevenlabs":
+        return AgentSession(
+            stt=elevenlabs.STT(api_key=_eleven_key(), language_code="en", use_realtime=True),
+            min_endpointing_delay=ENDPOINT_MIN_S,
+            llm=make_llm(),
+            tts=make_tts(),
+            vad=silero.VAD.load(),
+        )
+    raise SystemExit(f"CAR_VOICE must be gemini-live or elevenlabs, not {CAR_VOICE!r}")
 
 
 class CarCamera:
@@ -149,12 +195,42 @@ class CarCamera:
         self._failing = False
         self._task = None
         self._moved_at = 0.0
+        self.live = False  # a LiveVideo streams frames to the realtime model
+        self._live_kick = asyncio.Event()
+        self._live_due = 0.0
+        self._live_sent = 0.0  # capture time of the newest frame handed to the realtime model
 
     def moved(self):
         """The view just changed: only pictures requested from now on may be shown to the model."""
         self._moved_at = time.monotonic()
 
+    async def after_move(self):
+        """With live video, hand the model a picture taken after the move before it hears the move's result."""
+        if not self.live:
+            return
+        self._live_kick.set()
+        deadline = time.monotonic() + SNAPSHOT_WAIT_S
+        while self._live_sent < self._moved_at and time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
+
+    async def live_frame(self):
+        """Next picture for the realtime model: one a second, or at once after a move."""
+        try:
+            await asyncio.wait_for(self._live_kick.wait(), max(0.0, self._live_due - time.monotonic()))
+        except TimeoutError:
+            pass
+        self._live_kick.clear()
+        self._live_due = time.monotonic() + 1.0 / LIVE_FPS
+        frame = await self._fresh()
+        if frame:
+            self._live_sent = frame.timestamp
+        return frame
+
     async def snapshot(self):
+        frame = await self._fresh()
+        return frame.jpeg if frame else None
+
+    async def _fresh(self):
         self.vision.start()
         deadline = time.monotonic() + SNAPSHOT_WAIT_S
         while not ((frame := self.vision.newest(SNAPSHOT_MAX_AGE_S)) and frame.timestamp >= self._moved_at):
@@ -168,7 +244,7 @@ class CarCamera:
             log.info("camera back")
             self._failing = False
         self._telemetry.set_frame(frame.jpeg)
-        return frame.jpeg
+        return frame
 
     def start(self):
         self._task = asyncio.create_task(self._refresh())
@@ -181,6 +257,26 @@ class CarCamera:
     def close(self):
         if self._task:
             self._task.cancel()
+
+
+def _rgba(jpeg):
+    with Image.open(io.BytesIO(jpeg)) as image:
+        rgba = image.convert("RGBA")
+    return rtc.VideoFrame(rgba.width, rgba.height, rtc.VideoBufferType.RGBA, rgba.tobytes())
+
+
+class LiveVideo(VideoInput):
+    """The realtime model's video input, fed from the camera's single reader."""
+
+    def __init__(self, camera):
+        super().__init__(label="car-camera")
+        self.camera = camera
+        camera.live = True
+
+    async def __anext__(self) -> rtc.VideoFrame:
+        while not (frame := await self.camera.live_frame()):
+            pass  # live_frame already waited for the camera and logged the outage
+        return await asyncio.to_thread(_rgba, frame.jpeg)
 
 
 class Car:
@@ -256,14 +352,14 @@ class Car:
 
 
 def _forward(robot, cm):
-    gone, why = Driver(robot).forward(cm, STOP_CM)
+    gone, why = Driver(robot, stall=robot.stall).forward(cm, STOP_CM)
     if why:
         return f"Stopped after about {gone:.0f} cm: {why}."
     return f"Drove forward about {gone:.0f} cm. Clear distance ahead is {robot.distance()} cm."
 
 
 def _back(robot, cm):
-    gone, why = Driver(robot).back(cm)
+    gone, why = Driver(robot, stall=robot.stall).back(cm)
     return f"Backed up about {gone:.0f} cm" + (f", then stopped: {why}." if why else ".")
 
 
@@ -274,7 +370,7 @@ def _turn(robot, degrees):
 
 
 def _explore(robot, seconds):
-    driven, turns, why = Driver(robot).explore(seconds, STOP_CM)
+    driven, turns, why = Driver(robot, stall=robot.stall).explore(seconds, STOP_CM)
     return f"Explored: drove about {driven:.0f} cm and changed direction {turns} times. " + (f"Ended early: {why}." if why else "Time is up.")
 
 
@@ -302,9 +398,24 @@ class CarAgent(Agent):
         self.telemetry = car.telemetry
         self.jobs = TaskManager(car, camera.vision, self._speak_task)
         self.object_model = ObjectModel(PROJECT, LOCATION, MODEL)
+        self._last_move = None  # (label, monotonic time it finished); cleared by every new user turn
+
+    def new_user_turn(self):
+        """The repeat guard only catches moves the model re-issues by itself, never ones the person asked for."""
+        self._last_move = None
+
+    async def on_enter(self):
+        # On speech start, not the final transcript: Gemini Live often moves before the transcript is final.
+        self.session.on("user_state_changed", lambda ev: ev.new_state == "speaking" and self.new_user_turn())
 
     async def _speak_task(self, text: str) -> bool:
-        speech = self.session.say(text, allow_interruptions=True)
+        if self.session.tts:
+            speech = self.session.say(text, allow_interruptions=True)
+        else:  # Gemini Live has no separate voice to read text aloud, so the model says it
+            speech = self.session.generate_reply(
+                instructions=f"Say exactly this to the person, word for word, and call no tools: {text}",
+                allow_interruptions=True,
+            )
         try:
             await speech.wait_for_playout()
         except asyncio.CancelledError:
@@ -330,9 +441,14 @@ class CarAgent(Agent):
             return self._refuse(label, "Not moved: the human has paused my driving from the control pane.")
         if self.car.human_active():
             return self._refuse(label, "Not moved: the human is driving me right now. Wait and watch the camera.")
+        last, self._last_move = self._last_move, None
+        if last and last[0] == label and time.monotonic() - last[1] < REPEAT_S:
+            return self._refuse(label, "Skipped: that exact move just finished. Look at the camera view; if you still want it, call it again.")
         result = await self.jobs.dispatch(label, fn, background=False)
         await asyncio.sleep(SETTLE_S)
         self.camera.moved()
+        await self.camera.after_move()
+        self._last_move = (label, time.monotonic())
         return result
 
     def _refuse(self, label, reason):
@@ -395,6 +511,7 @@ class CarAgent(Agent):
         result = await self.jobs.dispatch(label, lambda r: _look(r, deg), background=False)
         await asyncio.sleep(SETTLE_S)
         self.camera.moved()
+        await self.camera.after_move()
         return result
 
     @function_tool()
@@ -477,6 +594,7 @@ class PaneActions:
         self.telemetry.touch()
 
     def say(self, text):
+        self.session.current_agent.new_user_turn()
         self.session.generate_reply(user_input=text)
 
 
@@ -510,16 +628,12 @@ async def entrypoint(ctx: agents.JobContext):
     telemetry.agent["initiative"] = INITIATIVE
     car = Car(HOST, PORT, telemetry)
     camera = CarCamera(CAMERA_URL, STREAM_URL, telemetry)
-    session = AgentSession(
-        stt=elevenlabs.STT(api_key=_eleven_key(), language_code="en", use_realtime=True),
-        min_endpointing_delay=ENDPOINT_MIN_S,
-        llm=make_llm(),
-        tts=make_tts(),
-        vad=silero.VAD.load(),
-    )
+    session = make_session()
     _follow_session(session, telemetry)
     agent = CarAgent(car, camera)
     await session.start(room=ctx.room, agent=agent)
+    if CAR_VOICE == "gemini-live":
+        session.input.video = LiveVideo(camera)
     camera.start()
     agent.jobs.start()
     pane = Dashboard(telemetry, Pilot(car, telemetry, MANUAL_SPEED, behaviors.scan),
