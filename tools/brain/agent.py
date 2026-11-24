@@ -5,9 +5,9 @@ Type instead of talking:          .venv/bin/python agent.py console --text
 Control pane (see + drive):       http://localhost:8765 while the agent runs
 
 Gemini Live hears the mic, watches the car camera (about one frame per second)
-and drives through the tools below. Every move is a short timed command that
-the car's firmware stops by itself, and forward moves stop when the ultrasonic
-sensor sees something closer than STOP_CM.
+and picks the moves; drive.py steers each move from the Mac with the gyro and
+range sensor. The firmware stops the wheels when commands stop arriving, and
+forward moves stop when the ultrasonic sensor sees something closer than STOP_CM.
 """
 
 import asyncio
@@ -26,6 +26,7 @@ from livekit.plugins import google
 from PIL import Image
 
 import behaviors
+from drive import Driver
 from dashboard import Dashboard, Pilot, Recorder, Telemetry
 from robot import DEFAULT_HOST, Robot
 
@@ -38,10 +39,6 @@ MODEL = os.environ.get("GEMINI_LIVE_MODEL", "gemini-3.8-live")
 LOCATION = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")  # Live is not served on "global"
 VOICE = os.environ.get("GEMINI_VOICE", "Puck")
 
-SPEED = 110
-CM_PER_S = 30.0  # forward speed at SPEED; calibrate on the floor
-DEG_PER_S = 120.0  # spin speed at SPEED; calibrate on the floor
-STEP_MS = 200  # forward moves run in steps this long, checking range and floor sensors between steps
 STOP_CM = 25
 SETTLE_S = 1.2  # let a fresh camera frame reach the model after moving
 REPEAT_S = 3.0  # Gemini Live sometimes re-issues the move it just made; an identical move this soon is dropped once
@@ -54,12 +51,19 @@ log = logging.getLogger("car-agent")
 INSTRUCTIONS = """You are Elegoo, a small, friendly four-wheeled robot car. You talk out loud in English,
 in short, natural sentences. You see the world live through a camera on your head, mounted low,
 about 15 cm above the floor, so people usually look tall and you may only see their legs.
+Your ears and voice are not on your body: the microphone and speaker are on a Mac computer. The
+person you talk with sits near the Mac and may be in a different spot, or a different room, than
+what your camera shows. Hearing someone clearly does not mean they are close to you.
 
 How you move:
 - Only move while you are doing a task someone gave you (find a person, find an object, come here,
-  look around). With no task, stay still and just talk.
-- Use drive_forward / drive_back with small distances (10 to 60 cm) and turn for rotations.
+  look around, patrol). With no task, stay still and just talk.
+- drive_forward runs smoothly, holds its heading and slows down by itself before obstacles, so
+  prefer one long move (up to 300 cm) over many short ones. turn reports the angle really turned.
   After each move, look at the new camera view before deciding the next move.
+- explore drives around on its own for a while; use it to patrol or to cover ground while
+  searching. It keeps running after the tool returns: watch the camera, and call stop to end it.
+  Any other move or look also ends it. You are told when it ends.
 - look_direction pans only your head and camera, which is quicker than turning the whole car.
 - If a move reports it was blocked, do not repeat it; turn and find another way.
 - When someone says stop, call stop immediately.
@@ -124,12 +128,20 @@ class Car:
         self._lock = threading.Lock()
         self._retry_at = 0.0
         self._human_at = 0.0
+        self.cancel = threading.Event()
 
     def human_input(self):
         self._human_at = time.monotonic()
 
     def human_active(self):
         return time.monotonic() - self._human_at < HUMAN_HOLD_S
+
+    def should_stop(self):
+        if self.cancel.is_set():
+            return "I was told to stop"
+        if self.human_active():
+            return "the human took over the controls"
+        return None
 
     def _call(self, fn, by):
         try:
@@ -183,33 +195,27 @@ class Car:
             self._drop()
 
 
-def _forward(robot, cm, human_active):
-    robot.head(behaviors.CENTER)
-    time.sleep(0.3)
-    total_ms = int(cm / CM_PER_S * 1000)
-    done_ms = 0
-    while done_ms < total_ms:
-        if human_active():
-            return f"Stopped after about {done_ms * CM_PER_S / 1000:.0f} cm: the human took over the controls."
-        if not robot.on_ground():
-            return f"Stopped after about {done_ms * CM_PER_S / 1000:.0f} cm: no floor under my front sensors (an edge, or I am lifted)."
-        ahead = robot.distance()
-        if ahead < STOP_CM:
-            return f"Stopped after about {done_ms * CM_PER_S / 1000:.0f} cm: obstacle {ahead} cm ahead."
-        step = min(STEP_MS, total_ms - done_ms)
-        robot.move("forward", SPEED, step)  # returns when the car has stopped itself
-        done_ms += step
-    return f"Drove forward about {cm} cm. Clear distance ahead was {robot.distance()} cm."
+def _forward(robot, cm, should_stop):
+    gone, why = Driver(robot, should_stop).forward(cm, STOP_CM)
+    if why:
+        return f"Stopped after about {gone:.0f} cm: {why}."
+    return f"Drove forward about {gone:.0f} cm. Clear distance ahead is {robot.distance()} cm."
 
 
-def _back(robot, cm):
-    robot.move("back", SPEED, int(cm / CM_PER_S * 1000))
-    return f"Backed up about {cm} cm."
+def _back(robot, cm, should_stop):
+    gone, why = Driver(robot, should_stop).back(cm)
+    return f"Backed up about {gone:.0f} cm" + (f", then stopped: {why}." if why else ".")
 
 
-def _turn(robot, degrees):
-    robot.move("left" if degrees > 0 else "right", SPEED, int(abs(degrees) / DEG_PER_S * 1000))
-    return f"Turned about {abs(degrees)} degrees {'left' if degrees > 0 else 'right'}."
+def _turn(robot, degrees, should_stop):
+    turned, why = Driver(robot, should_stop).turn(degrees)
+    side = "left" if turned > 0 else "right"
+    return f"Turned {abs(turned):.0f} degrees {side}" + (f", then stopped: {why}." if why else ".")
+
+
+def _explore(robot, seconds, should_stop):
+    driven, turns, why = Driver(robot, should_stop).explore(seconds, STOP_CM)
+    return f"Explored: drove about {driven:.0f} cm and changed direction {turns} times. " + (f"Ended early: {why}." if why else "Time is up.")
 
 
 def _look(robot, degrees):
@@ -229,6 +235,20 @@ class CarAgent(Agent):
         self.car = car
         self.telemetry = car.telemetry
         self._last_move = None
+        self._exploring = None
+
+    async def _end_exploring(self):
+        if self._exploring and not self._exploring.done():
+            self.car.cancel.set()
+            await self._exploring
+
+    async def _explore(self, seconds):
+        try:
+            result = await self._act(f"Explore {seconds} s", lambda r: _explore(r, seconds, self.car.should_stop), settle=False)
+        except ToolError as e:
+            result = str(e)
+        if not self.car.cancel.is_set():
+            self.session.generate_reply(instructions=f"Your exploring ended. {result} Tell the person briefly what you saw on the way.")
 
     async def _drive(self, label, move, fn):
         if not self.telemetry.agent["autonomy"]:
@@ -238,6 +258,12 @@ class CarAgent(Agent):
         last, self._last_move = self._last_move, None
         if last and last[0] == move and time.monotonic() - last[1] < REPEAT_S:
             return self._refuse(label, "Skipped: that exact move just finished. Look at the camera view; if you still want it, call it again.")
+        await self._end_exploring()
+        self.car.cancel.clear()
+        if fn is None:
+            self._exploring = asyncio.create_task(self._explore(move[1]))
+            self._last_move = (move, time.monotonic())
+            return "Exploring on my own now. Watch the camera; call stop to end it early."
         result = await self._act(label, fn)
         self._last_move = (move, time.monotonic())
         return result
@@ -260,13 +286,13 @@ class CarAgent(Agent):
 
     @function_tool()
     async def drive_forward(self, centimeters: int) -> str:
-        """Drive straight forward. Stops early if something is in the way.
+        """Drive straight forward, smoothly. Slows down and stops early if something is in the way.
 
         Args:
-            centimeters: distance to drive, 5 to 100.
+            centimeters: distance to drive, 5 to 300.
         """
-        cm = max(5, min(100, centimeters))
-        return await self._drive(f"Drive forward {cm} cm", ("forward", cm), lambda r: _forward(r, cm, self.car.human_active))
+        cm = max(5, min(300, centimeters))
+        return await self._drive(f"Drive forward {cm} cm", ("forward", cm), lambda r: _forward(r, cm, self.car.should_stop))
 
     @function_tool()
     async def drive_back(self, centimeters: int) -> str:
@@ -276,7 +302,7 @@ class CarAgent(Agent):
             centimeters: distance to back up, 5 to 40.
         """
         cm = max(5, min(40, centimeters))
-        return await self._drive(f"Back up {cm} cm", ("back", cm), lambda r: _back(r, cm))
+        return await self._drive(f"Back up {cm} cm", ("back", cm), lambda r: _back(r, cm, self.car.should_stop))
 
     @function_tool()
     async def turn(self, direction: Literal["left", "right"], degrees: int) -> str:
@@ -287,7 +313,19 @@ class CarAgent(Agent):
             degrees: how far to spin, 5 to 180.
         """
         deg = max(5, min(180, abs(degrees))) * (1 if direction == "left" else -1)
-        return await self._drive(f"Turn {direction} {abs(deg)}°", ("turn", deg), lambda r: _turn(r, deg))
+        return await self._drive(f"Turn {direction} {abs(deg)}°", ("turn", deg), lambda r: _turn(r, deg, self.car.should_stop))
+
+    @function_tool()
+    async def explore(self, seconds: int) -> str:
+        """Drive around on your own, avoiding obstacles, to patrol or to cover ground while searching.
+
+        Returns at once while the car keeps driving. You are told when it ends.
+
+        Args:
+            seconds: how long to explore, 10 to 120.
+        """
+        secs = max(10, min(120, seconds))
+        return await self._drive(f"Explore {secs} s", ("explore", secs), None)
 
     @function_tool()
     async def look_direction(self, direction: Literal["left", "right", "forward"], degrees: int = 45) -> str:
@@ -299,16 +337,20 @@ class CarAgent(Agent):
         """
         deg = 0 if direction == "forward" else max(10, min(80, abs(degrees))) * (1 if direction == "left" else -1)
         label = "Look forward" if deg == 0 else f"Look {direction} {abs(deg)}°"
+        await self._end_exploring()
         return await self._act(label, lambda r: _look(r, deg))
 
     @function_tool()
     async def scan_distances(self) -> str:
         """Sweep the head left to right and measure free space in each direction, in cm."""
+        await self._end_exploring()
         return await self._act("Scan distances", _scan, settle=False)
 
     @function_tool()
     async def stop(self) -> str:
         """Stop all motion immediately."""
+        self.car.cancel.set()
+        await self._end_exploring()
         await self._act("Stop", lambda r: r.stop(), settle=False)
         return "Stopped."
 

@@ -6,6 +6,7 @@ import time
 import urllib.request
 
 import behaviors
+import drive
 import teleop
 from robot import DEFAULT_HOST, DEFAULT_PORT, Robot
 
@@ -32,6 +33,7 @@ def main():
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("sensors")
     sub.add_parser("scan")
+    sub.add_parser("calibrate", help="on the floor, facing a wall 110 to 140 cm away: check turn direction, measure speed")
     sub.add_parser("keys").add_argument("--speed", type=int, default=120)
     for name in ("patrol", "follow"):
         sp = sub.add_parser(name)
@@ -47,6 +49,9 @@ def main():
         if args.cmd == "scan":
             for angle, cm in behaviors.scan(robot):
                 print(f"head {angle:3d} deg  {cm:3d} cm  {'#' * (cm // 5)}")
+            return
+        if args.cmd == "calibrate":
+            drive.calibrate(robot)
             return
         if args.cmd == "keys":
             teleop.run(robot, args.speed)

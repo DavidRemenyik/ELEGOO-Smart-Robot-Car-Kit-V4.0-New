@@ -121,22 +121,28 @@ class Robot:
         raise TimeoutError(f"no reply to {msg.decode()}; got {buf!r}")
 
     def stop(self):
-        for _ in range(3):
-            self.link.reset_input_buffer()
-            self.link.write(b'{"N":100}')
-            deadline = time.monotonic() + self.reply_timeout
-            buf = b""
-            while time.monotonic() < deadline:
-                buf += self.link.read(64)
-                if b"ok}" in buf:
-                    return
-        raise TimeoutError("car did not acknowledge stop")
+        self._request({"N": 110})  # clears every running function and, unlike N=100, is acknowledged
 
     def drive(self, direction, speed):
         self._request({"N": 3, "D1": DIRECTIONS[direction], "D2": max(0, min(255, int(speed)))})
 
     def move(self, direction, speed, ms):
         self._request({"N": 2, "D1": DIRECTIONS[direction], "D2": max(0, min(255, int(speed))), "T": int(ms)})
+
+    def _status(self, reply):
+        yaw, grounded = reply.split(",")
+        return int(yaw) / 10.0, grounded == "1"  # heading grows to the left, checked against the camera
+
+    def wheels(self, left, right):
+        """Signed wheel speeds, -255..255. The firmware stops them 0.4 s after the last command.
+
+        Returns (heading in degrees, on ground).
+        """
+        # The firmware's "left" motor channel drives the car's right wheels, checked against the camera.
+        return self._status(self._request({"N": 4, "D1": int(right), "D2": int(left)}))
+
+    def heading(self):
+        return self._status(self._request({"N": 24}))
 
     def head(self, angle):
         self._request({"N": 5, "D1": 1, "D2": max(0, min(180, int(angle)))})
