@@ -1,0 +1,825 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark light">
+<title>Elegoo Control</title>
+<style>
+:root {
+  --bg: #0a0c0f;
+  --surface: #11151a;
+  --surface-2: #171c22;
+  --surface-3: #1e242b;
+  --line: #262e37;
+  --text: #e7edf3;
+  --muted: #8d9aa7;
+  --faint: #5b6773;
+  --accent: #47c1ff;
+  --accent-ink: #04131c;
+  --ok: #3ccf7a;
+  --warn: #f2b33d;
+  --danger: #ff4d4f;
+  --danger-ink: #ffffff;
+  --agent: #b98cff;
+  --beam: 71 193 255;
+  --radius: 10px;
+  --radius-sm: 7px;
+  --gap: 14px;
+  --font: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", "Segoe UI", Roboto, sans-serif;
+  --mono: ui-monospace, "SF Mono", Menlo, monospace;
+}
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #eef1f4;
+    --surface: #ffffff;
+    --surface-2: #f5f7f9;
+    --surface-3: #e9edf1;
+    --line: #d8dee5;
+    --text: #12181e;
+    --muted: #55626f;
+    --faint: #8a96a2;
+    --accent: #0a84d6;
+    --accent-ink: #ffffff;
+    --ok: #13894a;
+    --warn: #a86400;
+    --danger: #d92d2f;
+    --agent: #7a4fd6;
+    --beam: 10 132 214;
+  }
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html, body { margin: 0; height: 100%; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.45 var(--font);
+  -webkit-font-smoothing: antialiased;
+}
+::selection { background: rgb(var(--beam) / .35); color: var(--text); }
+* { scrollbar-width: thin; scrollbar-color: var(--surface-3) transparent; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.num { font-variant-numeric: tabular-nums; }
+button { font: inherit; color: inherit; }
+
+/* ---------- top bar ---------- */
+.bar {
+  position: sticky; top: 0; z-index: 20;
+  display: flex; align-items: center; gap: 12px;
+  padding: 10px 18px;
+  background: var(--bg);
+  border-bottom: 1px solid var(--line);
+}
+.brand { display: flex; align-items: center; gap: 10px; font-weight: 650; font-size: 15px; letter-spacing: -.01em; margin-right: 6px; white-space: nowrap; }
+.brand svg { color: var(--accent); }
+.chips { display: flex; gap: 8px; flex-wrap: wrap; min-width: 0; }
+.chip {
+  display: inline-flex; align-items: center; gap: 7px;
+  height: 30px; padding: 0 11px;
+  border-radius: 999px; background: var(--surface-2);
+  color: var(--muted); font-size: 12.5px; white-space: nowrap;
+}
+.chip b { color: var(--text); font-weight: 600; }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--faint); flex: none; }
+.dot.ok { background: var(--ok); }
+.dot.warn { background: var(--warn); }
+.dot.bad { background: var(--danger); }
+.dot.agent { background: var(--agent); }
+.dot.pulse { animation: pulse 1.1s ease-in-out infinite; }
+@keyframes pulse { 50% { opacity: .35; transform: scale(.8); } }
+.spacer { flex: 1; }
+.toggle {
+  display: inline-flex; align-items: center; gap: 8px;
+  height: 34px; padding: 0 12px 0 8px; border-radius: 999px;
+  border: 0; background: var(--surface-2); cursor: pointer; white-space: nowrap;
+  font-size: 13px; color: var(--muted);
+}
+.toggle:hover { background: var(--surface-3); }
+.toggle .sw { width: 30px; height: 18px; border-radius: 999px; background: var(--surface-3); position: relative; transition: background .15s; flex: none; }
+.toggle .sw::after { content: ""; position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; border-radius: 50%; background: var(--muted); transition: transform .15s, background .15s; }
+.toggle[aria-checked="true"] { color: var(--text); }
+.toggle[aria-checked="true"] .sw { background: rgb(var(--beam) / .35); }
+.toggle[aria-checked="true"] .sw::after { transform: translateX(12px); background: var(--accent); }
+.estop {
+  display: inline-flex; align-items: center; gap: 8px;
+  height: 38px; padding: 0 16px; border-radius: 999px; border: 0;
+  background: var(--danger); color: var(--danger-ink); font-weight: 650; letter-spacing: .02em; cursor: pointer; white-space: nowrap;
+}
+.estop:hover { filter: brightness(1.08); }
+.estop:active, .estop.on { transform: scale(.97); filter: brightness(.92); }
+.estop kbd { font: 600 11px var(--mono); padding: 2px 6px; border-radius: 5px; background: rgb(0 0 0 / .22); }
+
+/* ---------- layout ---------- */
+.grid {
+  display: grid; gap: var(--gap); padding: var(--gap) 18px 18px;
+  grid-template-columns: minmax(0, 1.55fr) minmax(330px, 1fr) minmax(330px, 1fr);
+  align-items: start;
+}
+.panel { background: var(--surface); border-radius: var(--radius); padding: 14px; min-width: 0; }
+.panel h2 { margin: 0 0 10px; font-size: 13px; font-weight: 600; color: var(--muted); display: flex; align-items: center; gap: 8px; }
+.panel h2 .right { margin-left: auto; font-weight: 500; color: var(--faint); font-size: 12px; }
+.col { display: flex; flex-direction: column; gap: var(--gap); min-width: 0; }
+
+/* ---------- camera ---------- */
+.cam { position: relative; aspect-ratio: 4 / 3; background: #000; border-radius: var(--radius-sm); overflow: hidden; }
+.cam img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+.cam img.flip { transform: rotate(180deg); }
+.cam .empty { position: absolute; inset: 0; display: grid; place-items: center; color: #8d9aa7; font-size: 13px; text-align: center; padding: 20px; }
+.hud { position: absolute; inset: 0; pointer-events: none; color: #fff; }
+.hud svg { position: absolute; inset: 0; width: 100%; height: 100%; }
+.hud .readout {
+  position: absolute; display: flex; flex-direction: column; align-items: center; transform: translate(-50%, 0);
+  font-variant-numeric: tabular-nums; text-shadow: 0 1px 3px rgb(0 0 0 / .7);
+}
+.hud .readout .v { font-size: 26px; font-weight: 650; letter-spacing: -.02em; line-height: 1; }
+.hud .readout .l { font-size: 11px; opacity: .85; margin-top: 3px; }
+.hud .tag {
+  position: absolute; bottom: 10px; display: inline-flex; align-items: center; gap: 6px;
+  height: 24px; padding: 0 9px; border-radius: 999px; background: rgb(0 0 0 / .55); font-size: 12px;
+}
+.hud .tag.right { right: 10px; }
+.toasts { position: absolute; left: 10px; bottom: 10px; display: flex; flex-direction: column; gap: 6px; max-width: 70%; }
+.toast { padding: 6px 10px; border-radius: 8px; background: rgb(0 0 0 / .66); color: #fff; font-size: 12.5px; transition: opacity .4s; }
+.toast.warn { background: rgb(160 90 0 / .85); }
+.seg { display: inline-flex; background: var(--surface-2); border-radius: 999px; padding: 3px; gap: 2px; }
+.seg button { border: 0; background: transparent; color: var(--muted); height: 26px; padding: 0 11px; border-radius: 999px; cursor: pointer; font-size: 12.5px; }
+.seg button[aria-pressed="true"] { background: var(--surface-3); color: var(--text); }
+
+/* ---------- controls ---------- */
+.controls { display: grid; grid-template-columns: auto auto 1fr; gap: 22px; align-items: end; margin-top: 14px; }
+.pad { display: grid; grid-template-columns: repeat(3, 48px); grid-template-rows: repeat(2, 48px); gap: 6px; }
+.pad .cap { grid-column: 1 / -1; }
+.key {
+  display: grid; place-items: center; position: relative;
+  border: 0; border-radius: 9px; background: var(--surface-2); color: var(--text);
+  font: 600 15px var(--font); cursor: pointer; touch-action: none; user-select: none; -webkit-user-select: none;
+  box-shadow: inset 0 -2px 0 var(--line);
+  transition: background .08s, transform .08s;
+}
+.key:hover { background: var(--surface-3); }
+.key.on { background: var(--accent); color: var(--accent-ink); box-shadow: none; transform: translateY(1px); }
+.key small { position: absolute; bottom: 3px; font-size: 9px; font-weight: 500; color: var(--faint); }
+.key.on small { color: inherit; opacity: .8; }
+.padlabel { font-size: 12px; color: var(--muted); margin-bottom: 7px; }
+.side { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+.speed { display: flex; align-items: center; gap: 10px; font-size: 12.5px; color: var(--muted); }
+.speed input { flex: 1; accent-color: var(--accent); min-width: 80px; }
+.drivers { display: flex; gap: 8px; flex-wrap: wrap; }
+.who { font-size: 12.5px; color: var(--muted); }
+.who b { color: var(--text); font-weight: 600; }
+
+/* ---------- radar & profile ---------- */
+svg text { font-family: var(--font); }
+.radar { width: 100%; height: auto; display: block; }
+.legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--muted); margin-top: 8px; }
+.legend i { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; }
+.metrics { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 12px; }
+.metric { background: var(--surface-2); border-radius: var(--radius-sm); padding: 8px 10px; }
+.metric .l { font-size: 11.5px; color: var(--muted); }
+.metric .v { font-size: 18px; font-weight: 650; letter-spacing: -.01em; }
+.note { font-size: 12px; color: var(--muted); margin: 8px 0 0; }
+.note b { color: var(--text); font-weight: 600; }
+
+.floor { display: grid; grid-template-columns: repeat(3, 1fr) 1.3fr; gap: 10px; align-items: end; }
+.bar-col { display: flex; flex-direction: column; align-items: center; gap: 6px; }
+.meter { position: relative; width: 100%; max-width: 46px; height: 84px; background: var(--surface-2); border-radius: 7px; overflow: hidden; }
+.meter .fill { position: absolute; left: 0; right: 0; bottom: 0; background: var(--ok); transition: height .15s; }
+.meter .fill.off { background: var(--danger); }
+.meter .thr { position: absolute; left: 0; right: 0; height: 0; border-top: 1px dashed var(--text); opacity: .6; }
+.bar-col .l { font-size: 11.5px; color: var(--muted); }
+.floor-state { display: flex; flex-direction: column; gap: 4px; padding-bottom: 4px; }
+.floor-state .v { font-size: 16px; font-weight: 650; }
+.floor-state .l { font-size: 12px; color: var(--muted); }
+
+/* ---------- agent ---------- */
+.agent-col { position: sticky; top: 72px; max-height: calc(100vh - 88px); display: flex; flex-direction: column; }
+.agent-col .panel { display: flex; flex-direction: column; min-height: 0; }
+.convo { flex: 1; min-height: 160px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; padding-right: 4px; }
+.msg { max-width: 88%; padding: 8px 11px; border-radius: 12px; font-size: 13.5px; line-height: 1.4; }
+.msg.user { align-self: flex-end; background: rgb(var(--beam) / .16); border-bottom-right-radius: 4px; }
+.msg.agent { align-self: flex-start; background: var(--surface-2); border-bottom-left-radius: 4px; }
+.msg.interim { opacity: .65; font-style: italic; }
+.msg .who-l { display: block; font-size: 11px; color: var(--muted); margin-bottom: 2px; }
+.empty-note { color: var(--faint); font-size: 13px; text-align: center; margin: auto 0; padding: 18px 0; }
+.say { display: flex; gap: 8px; margin-top: 10px; }
+.say input {
+  flex: 1; min-width: 0; height: 40px; padding: 0 12px; border-radius: 9px;
+  border: 1px solid var(--line); background: var(--surface-2); color: var(--text); font: inherit;
+}
+.say input::placeholder { color: var(--faint); }
+.say input:focus-visible { outline: 2px solid var(--accent); outline-offset: 0; border-color: transparent; }
+.send { width: 40px; height: 40px; border: 0; border-radius: 9px; background: var(--accent); color: var(--accent-ink); display: grid; place-items: center; cursor: pointer; flex: none; }
+.send:disabled { opacity: .4; cursor: default; }
+.tools { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; overflow-y: auto; max-height: 300px; }
+.tool { display: grid; grid-template-columns: 18px 1fr auto; gap: 4px 9px; padding: 7px 4px; border-bottom: 1px solid var(--line); font-size: 13px; }
+.tool:last-child { border-bottom: 0; }
+.tool .ico { padding-top: 1px; }
+.tool .ico.done { color: var(--ok); }
+.tool .ico.error { color: var(--warn); }
+.tool .ico.running { color: var(--accent); animation: spin 1s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.tool .t { color: var(--faint); font-size: 11.5px; }
+.tool .res { grid-column: 2 / -1; color: var(--muted); font-size: 12.5px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.offline-banner { display: none; padding: 8px 18px; background: rgb(242 179 61 / .14); color: var(--warn); font-size: 13px; }
+.offline-banner.on { display: block; }
+
+@media (max-width: 1240px) {
+  .grid { grid-template-columns: minmax(0, 1.4fr) minmax(320px, 1fr); }
+  .agent-col { grid-column: 1 / -1; position: static; max-height: none; }
+  .convo { max-height: 340px; }
+}
+@media (max-width: 760px) {
+  .bar { flex-wrap: wrap; padding: 8px 12px; gap: 8px; }
+  .chips { order: 3; width: 100%; }
+  .toggle .lbl-long { display: none; }
+  .grid { grid-template-columns: 1fr; padding: 12px; gap: 12px; }
+  .controls { grid-template-columns: auto auto; gap: 16px; justify-content: space-between; }
+  .controls .side { grid-column: 1 / -1; }
+  .pad { grid-template-columns: repeat(3, 48px); grid-template-rows: repeat(2, 48px); gap: 5px; }
+  .key small { display: none; }
+  .bar { position: static; }
+  .estop { position: fixed; right: 14px; bottom: calc(14px + env(safe-area-inset-bottom)); z-index: 30; height: 52px; padding: 0 20px; box-shadow: 0 4px 14px rgb(0 0 0 / .35); }
+  .agent-col { padding-bottom: 72px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::after { animation: none !important; transition: none !important; }
+}
+</style>
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="i-car" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 17h2c.6 0 1-.4 1-1v-3c0-.9-.7-1.7-1.5-1.9C18.7 10.6 16 10 16 10s-1.3-1.4-2.2-2.3c-.5-.4-1.1-.7-1.8-.7H5c-.6 0-1.1.4-1.4.9l-1.4 2.9A3.7 3.7 0 0 0 2 12v4c0 .6.4 1 1 1h2"/><circle cx="7" cy="17" r="2"/><path d="M9 17h6"/><circle cx="17" cy="17" r="2"/></symbol>
+  <symbol id="i-octagon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polygon points="7.86 2 16.14 2 22 7.86 22 16.14 16.14 22 7.86 22 2 16.14 2 7.86 7.86 2"/><line x1="8" y1="12" x2="16" y2="12"/></symbol>
+  <symbol id="i-send" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></symbol>
+  <symbol id="i-alert" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></symbol>
+  <symbol id="i-loader" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M21 12a9 9 0 1 1-6.2-8.6"/></symbol>
+  <symbol id="i-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5"/><path d="m5 12 7-7 7 7"/></symbol>
+  <symbol id="i-target" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="2.5"/></symbol>
+  <symbol id="i-scan" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20 12 12"/><path d="M12 4a8 8 0 0 1 8 8"/><path d="M12 8a4 4 0 0 1 4 4"/></symbol>
+</svg>
+
+<header class="bar">
+  <div class="brand"><svg width="20" height="20"><use href="#i-car"/></svg>Elegoo Control</div>
+  <div class="chips">
+    <span class="chip" id="chip-link"><span class="dot" id="link-dot"></span>Car <b id="link-txt">connecting</b></span>
+    <span class="chip"><span class="dot" id="agent-dot"></span>Agent <b id="agent-txt">starting</b></span>
+    <span class="chip"><span class="dot" id="cam-dot"></span>Camera <b id="cam-txt">waiting</b></span>
+  </div>
+  <span class="spacer"></span>
+  <button class="toggle" id="t-auto" role="switch" aria-checked="true" title="Let the agent drive the wheels"><span class="sw"></span><span>Agent drives<span class="lbl-long"> itself</span></span></button>
+  <button class="toggle" id="t-mic" role="switch" aria-checked="true" title="Mac microphone on or off"><span class="sw"></span>Mic</button>
+  <button class="estop" id="estop" title="Stop the car and the agent (Space)"><svg width="16" height="16"><use href="#i-octagon"/></svg>STOP <kbd>Space</kbd></button>
+</header>
+<div class="offline-banner" id="pane-off">Lost connection to the agent. Reconnecting...</div>
+
+<main class="grid">
+  <section class="col">
+    <div class="panel">
+      <h2>Camera
+        <span class="right">
+          <span class="seg" role="group" aria-label="Camera source">
+            <button id="src-live" aria-pressed="true">Live stream</button>
+            <button id="src-agent" aria-pressed="false">Agent's view</button>
+          </span>
+        </span>
+      </h2>
+      <div class="cam" id="cam">
+        <div class="empty" id="cam-empty">Waiting for the car camera</div>
+        <img id="cam-img" alt="Live view from the car camera" hidden>
+        <div class="hud">
+          <svg viewBox="0 0 400 300" preserveAspectRatio="none" id="hud-svg"></svg>
+          <span class="tag right" id="hud-who" hidden></span>
+          <div class="readout" id="hud-read"><span class="v num" id="hud-dist">--</span><span class="l">sonar distance</span></div>
+          <div class="toasts" id="toasts" aria-live="polite"></div>
+        </div>
+      </div>
+      <div class="controls">
+        <div>
+          <div class="padlabel">Drive</div>
+          <div class="pad">
+            <span></span>
+            <button class="key" data-key="w" aria-label="Drive forward (W)">W<small>fwd</small></button>
+            <span></span>
+            <button class="key" data-key="a" aria-label="Spin left (A)">A<small>left</small></button>
+            <button class="key" data-key="s" aria-label="Back up (S)">S<small>back</small></button>
+            <button class="key" data-key="d" aria-label="Spin right (D)">D<small>right</small></button>
+          </div>
+        </div>
+        <div>
+          <div class="padlabel">Camera head</div>
+          <div class="pad">
+            <span></span>
+            <button class="key" data-key="ArrowUp" aria-label="Center the head (Up arrow)"><svg width="18" height="18"><use href="#i-target"/></svg><small>center</small></button>
+            <span></span>
+            <button class="key" data-key="ArrowLeft" aria-label="Pan head left (Left arrow)"><svg width="18" height="18" style="transform:rotate(-90deg)"><use href="#i-arrow"/></svg></button>
+            <button class="key" data-key="ArrowDown" aria-label="Scan around (Down arrow)"><svg width="18" height="18"><use href="#i-scan"/></svg><small>scan</small></button>
+            <button class="key" data-key="ArrowRight" aria-label="Pan head right (Right arrow)"><svg width="18" height="18" style="transform:rotate(90deg)"><use href="#i-arrow"/></svg></button>
+          </div>
+        </div>
+        <div class="side">
+          <label class="speed">Speed <input type="range" id="speed" min="80" max="255" step="5" value="150"><span class="num" id="speed-v">150</span></label>
+          <div class="who" id="who">Nobody is driving</div>
+          <div class="who">Hold keys to drive. Release and the car stops. Taking the wheel pauses the agent's moves.</div>
+        </div>
+      </div>
+    </div>
+    <div class="panel">
+      <h2>Floor sensors <span class="right">infrared, under the nose</span></h2>
+      <div class="floor">
+        <div class="bar-col"><div class="meter"><div class="fill" id="f-l"></div><div class="thr"></div></div><span class="l num" id="f-lv">L --</span></div>
+        <div class="bar-col"><div class="meter"><div class="fill" id="f-m"></div><div class="thr"></div></div><span class="l num" id="f-mv">M --</span></div>
+        <div class="bar-col"><div class="meter"><div class="fill" id="f-r"></div><div class="thr"></div></div><span class="l num" id="f-rv">R --</span></div>
+        <div class="floor-state"><span class="v" id="f-state">--</span><span class="l">Readings above the dashed line on all three mean no floor: an edge, or the car is lifted.</span></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="col">
+    <div class="panel">
+      <h2>Around the car <span class="right">top view, sonar</span></h2>
+      <svg class="radar" id="radar" viewBox="-170 -176 340 206" role="img" aria-label="Top view of the car with sonar readings"></svg>
+      <div class="legend">
+        <span><i style="background: rgb(var(--beam) / .45)"></i>Sonar beam</span>
+        <span><i style="background: var(--accent)"></i>Echo</span>
+        <span><i style="background: var(--warn)"></i>Stop distance</span>
+      </div>
+      <div class="metrics">
+        <div class="metric"><div class="l">Ahead</div><div class="v num" id="m-dist">--</div></div>
+        <div class="metric"><div class="l">Head</div><div class="v num" id="m-head">--</div></div>
+        <div class="metric"><div class="l">Link</div><div class="v num" id="m-rtt">--</div></div>
+      </div>
+    </div>
+    <div class="panel">
+      <h2>Side view <span class="right">what the sensors can reach, height x2</span></h2>
+      <svg class="radar" id="profile" viewBox="-14 -50 114 54" role="img" aria-label="Side view of sonar beam and camera coverage"></svg>
+      <p class="note" id="blind-note"></p>
+    </div>
+  </section>
+
+  <section class="col agent-col">
+    <div class="panel" style="flex: 1">
+      <h2>Conversation <span class="right" id="agent-sub"></span></h2>
+      <div class="convo" id="convo"><p class="empty-note">The conversation appears here.</p></div>
+      <form class="say" id="say">
+        <input id="say-in" placeholder="Tell the agent something" autocomplete="off" aria-label="Message to the agent">
+        <button class="send" id="say-btn" aria-label="Send to the agent" disabled><svg width="17" height="17"><use href="#i-send"/></svg></button>
+      </form>
+    </div>
+    <div class="panel">
+      <h2>Agent actions</h2>
+      <ul class="tools" id="tools"><li class="empty-note">Tool calls appear here.</li></ul>
+    </div>
+  </section>
+</main>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const NS = "http://www.w3.org/2000/svg";
+const el = (tag, attrs = {}, parent) => {
+  const n = document.createElementNS(NS, tag);
+  for (const [k, v] of Object.entries(attrs)) n.setAttribute(k, v);
+  if (parent) parent.appendChild(n);
+  return n;
+};
+const rad = (d) => (d * Math.PI) / 180;
+
+let G = null;            // geometry from the server
+let S = null;            // latest state
+let ws = null;
+let camSource = "live";
+let streamUrl = null;
+let streamFailed = false;
+let lastFrameId = 0;
+const frameTimes = [];
+const shownToasts = new Set();
+
+/* ---------- websocket ---------- */
+function connect() {
+  ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.onopen = () => $("pane-off").classList.remove("on");
+  ws.onclose = () => {
+    $("pane-off").classList.add("on");
+    releaseAll(false);
+    setTimeout(connect, 1000);
+  };
+  ws.onmessage = (e) => {
+    const msg = JSON.parse(e.data);
+    if (msg.t === "hello") onHello(msg);
+    else if (msg.t === "state") render(msg);
+  };
+}
+const send = (obj) => { if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj)); };
+
+function onHello(msg) {
+  G = msg.geometry;
+  streamUrl = msg.stream_url;
+  $("speed").value = msg.speed; $("speed-v").textContent = msg.speed;
+  drawRadarStatic();
+  drawProfile();
+  setCamSource(camSource);
+}
+
+/* ---------- keyboard + pad ---------- */
+const DRIVE = { w: "forward", s: "back", a: "left", d: "right" };
+const held = [];             // drive keys in press order
+let pan = 0;
+const pressed = new Set();
+let hbTimer = null;
+
+function keyEls(k) { return document.querySelectorAll(`.key[data-key="${k}"]`); }
+function light(k, on) { keyEls(k).forEach((b) => b.classList.toggle("on", on)); }
+
+function press(k) {
+  if (pressed.has(k)) return;
+  pressed.add(k); light(k, true);
+  if (k in DRIVE) { held.push(k); sendDrive(); }
+  else if (k === "ArrowLeft") { pan = 1; send({ t: "pan", dir: 1 }); }
+  else if (k === "ArrowRight") { pan = -1; send({ t: "pan", dir: -1 }); }
+  else if (k === "ArrowUp") send({ t: "center" });
+  else if (k === "ArrowDown") send({ t: "scan" });
+  else if (k === " ") estop();
+  ensureHeartbeat();
+}
+function release(k) {
+  if (!pressed.has(k)) return;
+  pressed.delete(k); light(k, false);
+  if (k in DRIVE) { held.splice(held.indexOf(k), 1); sendDrive(); }
+  else if ((k === "ArrowLeft" && pan === 1) || (k === "ArrowRight" && pan === -1)) { pan = 0; send({ t: "pan", dir: 0 }); }
+}
+function releaseAll(notify = true) {
+  [...pressed].forEach((k) => { pressed.delete(k); light(k, false); });
+  held.length = 0; pan = 0;
+  if (notify) { send({ t: "drive", dir: null }); send({ t: "pan", dir: 0 }); }
+}
+function sendDrive() {
+  const k = held[held.length - 1];
+  send({ t: "drive", dir: k ? DRIVE[k] : null });
+}
+function ensureHeartbeat() {
+  if (hbTimer) return;
+  hbTimer = setInterval(() => {
+    if (held.length || pan) send({ t: "hb" });
+    else { clearInterval(hbTimer); hbTimer = null; }
+  }, 120);
+}
+function estop() {
+  releaseAll();
+  send({ t: "estop" });
+  const b = $("estop"); b.classList.add("on"); setTimeout(() => b.classList.remove("on"), 180);
+}
+
+const typing = () => document.activeElement && ["INPUT", "TEXTAREA"].includes(document.activeElement.tagName) && document.activeElement.type !== "range";
+document.addEventListener("keydown", (e) => {
+  if (typing() || e.metaKey || e.ctrlKey || e.altKey) return;
+  const k = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+  if (k in DRIVE || k.startsWith("Arrow") || k === " ") {
+    e.preventDefault();
+    if (!e.repeat) press(k);
+  }
+});
+document.addEventListener("keyup", (e) => {
+  const k = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+  release(k);
+});
+window.addEventListener("blur", () => releaseAll());
+document.addEventListener("visibilitychange", () => { if (document.hidden) releaseAll(); });
+
+document.querySelectorAll(".key").forEach((b) => {
+  const k = b.dataset.key;
+  b.addEventListener("pointerdown", (e) => { e.preventDefault(); b.setPointerCapture(e.pointerId); press(k); });
+  const up = () => release(k);
+  b.addEventListener("pointerup", up);
+  b.addEventListener("pointercancel", up);
+  b.addEventListener("lostpointercapture", up);
+  b.addEventListener("contextmenu", (e) => e.preventDefault());
+});
+$("estop").addEventListener("click", estop);
+$("t-auto").addEventListener("click", () => send({ t: "autonomy", on: $("t-auto").getAttribute("aria-checked") !== "true" }));
+$("t-mic").addEventListener("click", () => send({ t: "mic", on: $("t-mic").getAttribute("aria-checked") !== "true" }));
+$("speed").addEventListener("input", (e) => { $("speed-v").textContent = e.target.value; send({ t: "speed", value: +e.target.value }); });
+$("say-in").addEventListener("input", () => { $("say-btn").disabled = !$("say-in").value.trim(); });
+$("say").addEventListener("submit", (e) => {
+  e.preventDefault();
+  const text = $("say-in").value.trim();
+  if (!text) return;
+  send({ t: "say", text });
+  $("say-in").value = ""; $("say-btn").disabled = true;
+});
+
+/* ---------- camera ---------- */
+$("src-live").addEventListener("click", () => setCamSource("live"));
+$("src-agent").addEventListener("click", () => setCamSource("agent"));
+function setCamSource(src) {
+  camSource = src;
+  $("src-live").setAttribute("aria-pressed", src === "live");
+  $("src-agent").setAttribute("aria-pressed", src === "agent");
+  const img = $("cam-img");
+  if (src === "live" && streamUrl && !streamFailed) {
+    img.classList.add("flip");
+    img.onerror = () => { streamFailed = true; toast("Live stream unavailable, showing the agent's frames", "warn"); setCamSource("agent"); };
+    img.onload = () => { img.hidden = false; $("cam-empty").hidden = true; };
+    img.src = streamUrl;
+  } else {
+    img.classList.remove("flip");
+    img.onerror = null;
+    img.onload = () => { img.hidden = false; $("cam-empty").hidden = true; };
+    if (lastFrameId) img.src = `/frame.jpg?id=${lastFrameId}`;
+  }
+}
+
+/* ---------- radar (top view, cm, forward = up) ---------- */
+const sonarOrigin = () => ({ x: 0, y: -G.sonar_x_cm });
+const polar = (headDeg, r) => {
+  const th = rad(headDeg - 90);           // + is left of the car
+  const o = sonarOrigin();
+  return { x: o.x - Math.sin(th) * r, y: o.y - Math.cos(th) * r };
+};
+let radarDyn = null;
+
+function drawRadarStatic() {
+  const svg = $("radar"); svg.innerHTML = "";
+  const o = sonarOrigin();
+  const grid = el("g", { fill: "none", stroke: "var(--line)", "stroke-width": 1, "vector-effect": "non-scaling-stroke" }, svg);
+  for (const r of [50, 100, 150]) {
+    el("path", { d: `M ${o.x - r} ${o.y} A ${r} ${r} 0 0 1 ${o.x + r} ${o.y}` }, grid);
+    el("text", { x: o.x + 3, y: o.y - r + 10, fill: "var(--faint)", stroke: "none", "font-size": 9 }, svg).textContent = `${r} cm`;
+  }
+  for (const a of [10, 50, 90, 130, 170]) {
+    const p = polar(a, 150);
+    el("line", { x1: o.x, y1: o.y, x2: p.x, y2: p.y, stroke: "var(--line)", "stroke-dasharray": "2 4", "vector-effect": "non-scaling-stroke" }, svg);
+  }
+  const stop = 25;
+  el("path", { d: `M ${o.x - stop} ${o.y} A ${stop} ${stop} 0 0 1 ${o.x + stop} ${o.y}`, fill: "none", stroke: "var(--warn)", "stroke-width": 1.5, "stroke-dasharray": "4 3", "vector-effect": "non-scaling-stroke" }, svg);
+
+  radarDyn = el("g", {}, svg);
+
+  const L = G.body_length_cm, W = G.body_width_cm;
+  const car = el("g", {}, svg);
+  for (const sx of [-1, 1]) for (const sy of [-1, 1]) {
+    el("rect", { x: sx * (G.wheel_y_cm + 1.3) - G.wheel_width_cm / 2 - (sx < 0 ? 0 : 0), y: -sy * G.wheel_x_cm - G.wheel_radius_cm, width: G.wheel_width_cm, height: G.wheel_radius_cm * 2, rx: 1, fill: "var(--faint)" }, car);
+  }
+  el("rect", { x: -W / 2 + 2.6, y: -L / 2, width: W - 5.2, height: L, rx: 3, fill: "var(--surface-3)", stroke: "var(--muted)", "stroke-width": 1, "vector-effect": "non-scaling-stroke" }, car);
+  el("text", { x: 0, y: L / 2 + 12, fill: "var(--faint)", "font-size": 9, "text-anchor": "middle" }, svg).textContent = "car (to scale)";
+}
+
+function renderRadar() {
+  if (!radarDyn || !S) return;
+  radarDyn.innerHTML = "";
+  const o = sonarOrigin();
+  const head = S.sensors.head;
+  const half = G.sonar_cone_deg / 2;
+  const max = G.sonar_max_cm;
+
+  const pts = S.sonar.filter((p) => p[1] < max).slice().sort((a, b) => a[0] - b[0]);
+  if (pts.length >= 3) {
+    const d = [`M ${o.x} ${o.y}`, ...pts.map((p) => { const q = polar(p[0], p[1]); return `L ${q.x.toFixed(1)} ${q.y.toFixed(1)}`; }), "Z"].join(" ");
+    el("path", { d, fill: "rgb(var(--beam) / .08)", stroke: "rgb(var(--beam) / .35)", "stroke-width": 1, "vector-effect": "non-scaling-stroke" }, radarDyn);
+  }
+
+  const wedge = (r, fill) => {
+    const a = polar(head - half, r), b = polar(head + half, r);
+    el("path", { d: `M ${o.x} ${o.y} L ${a.x} ${a.y} A ${r} ${r} 0 0 0 ${b.x} ${b.y} Z`, fill }, radarDyn);
+  };
+  wedge(max, "rgb(var(--beam) / .07)");
+  const dist = S.sensors.distance;
+  if (dist != null) {
+    const r = Math.min(dist, max);
+    wedge(r, "rgb(var(--beam) / .28)");
+    if (dist < max) {
+      const a = polar(head - half, r), b = polar(head + half, r);
+      el("path", { d: `M ${a.x} ${a.y} A ${r} ${r} 0 0 0 ${b.x} ${b.y}`, fill: "none", stroke: dist < S.stop_cm ? "var(--danger)" : "var(--accent)", "stroke-width": 3, "stroke-linecap": "round", "vector-effect": "non-scaling-stroke" }, radarDyn);
+    }
+  }
+  for (const [h, cm, age] of S.sonar) {
+    if (cm >= max) continue;
+    const q = polar(h, cm);
+    el("circle", { cx: q.x, cy: q.y, r: 2.6, fill: cm < S.stop_cm ? "var(--danger)" : "var(--accent)", opacity: Math.max(0.15, 1 - age / 8) }, radarDyn);
+  }
+  const tip = polar(head, 14);
+  el("line", { x1: o.x, y1: o.y, x2: tip.x, y2: tip.y, stroke: "var(--text)", "stroke-width": 2, "stroke-linecap": "round", "vector-effect": "non-scaling-stroke" }, radarDyn);
+}
+
+/* ---------- side profile (x forward, z up, height exaggerated x2) ---------- */
+function drawProfile() {
+  const svg = $("profile"); svg.innerHTML = "";
+  const Z = 2;                                     // vertical exaggeration
+  const y = (z) => -z * Z;
+  const half = rad(G.sonar_cone_deg / 2);
+  const sx = G.sonar_x_cm, sz = G.sonar_height_cm;
+  const floorHit = sx + sz / Math.tan(half);
+  const xEnd = 98;
+  const lowerAt = (x) => sz - (x - sx) * Math.tan(half);
+  const stopX = sx + 25;
+  const minH = lowerAt(stopX);
+
+  el("line", { x1: -14, y1: 0, x2: 100, y2: 0, stroke: "var(--muted)", "stroke-width": 1, "vector-effect": "non-scaling-stroke" }, svg);
+  for (let x = 0; x <= 90; x += 10) {
+    el("line", { x1: x, y1: 0, x2: x, y2: 1.5, stroke: "var(--faint)", "vector-effect": "non-scaling-stroke" }, svg);
+    if (x % 20 === 0 && x > 0) el("text", { x, y: 4, "font-size": 2.6, fill: "var(--faint)", "text-anchor": "middle" }, svg).textContent = `${x}`;
+  }
+
+  // blind zone under the beam
+  el("path", { d: `M ${G.nose_x_cm} 0 L ${G.nose_x_cm} ${y(lowerAt(G.nose_x_cm))} L ${floorHit} 0 Z`, fill: "rgb(255 77 79 / .14)", stroke: "none" }, svg);
+  // beam
+  const upperEnd = sz + (xEnd - sx) * Math.tan(half);
+  el("path", { d: `M ${sx} ${y(sz)} L ${xEnd} ${y(upperEnd)} L ${xEnd} 0 L ${floorHit} 0 Z`, fill: "rgb(var(--beam) / .18)" }, svg);
+  el("line", { x1: sx, y1: y(sz), x2: xEnd, y2: y(upperEnd), stroke: "rgb(var(--beam) / .7)", "vector-effect": "non-scaling-stroke" }, svg);
+  el("line", { x1: sx, y1: y(sz), x2: floorHit, y2: 0, stroke: "rgb(var(--beam) / .7)", "vector-effect": "non-scaling-stroke" }, svg);
+
+  // camera wedge (tilt estimated)
+  const cx = G.camera_x_cm, cz = G.camera_height_cm, tilt = rad(G.camera_tilt_deg), hv = rad(G.camera_vfov_deg / 2);
+  const camLow = tilt - hv;
+  const camLowEnd = camLow < 0 ? { x: cx + cz / Math.tan(-camLow), z: 0 } : { x: xEnd, z: cz + (xEnd - cx) * Math.tan(camLow) };
+  const camHighZ = Math.min(23, cz + (xEnd - cx) * Math.tan(tilt + hv));
+  el("line", { x1: cx, y1: y(cz), x2: Math.min(camLowEnd.x, xEnd), y2: y(camLowEnd.z), stroke: "var(--agent)", "stroke-dasharray": "3 2", "vector-effect": "non-scaling-stroke" }, svg);
+  el("line", { x1: cx, y1: y(cz), x2: xEnd, y2: y(camHighZ), stroke: "var(--agent)", "stroke-dasharray": "3 2", "vector-effect": "non-scaling-stroke" }, svg);
+  el("text", { x: cx + 3.5, y: y(cz + 3.2), "font-size": 2.8, fill: "var(--agent)" }, svg).textContent = "camera view, tilt estimated";
+
+  // stop distance marker
+  el("line", { x1: stopX, y1: 0, x2: stopX, y2: y(minH), stroke: "var(--warn)", "stroke-width": 1.5, "vector-effect": "non-scaling-stroke" }, svg);
+  el("text", { x: stopX + 1.2, y: y(minH / 2) + 1, "font-size": 2.8, fill: "var(--warn)" }, svg).textContent = `${minH.toFixed(1)} cm`;
+  el("text", { x: (G.nose_x_cm + floorHit) / 2 + 8, y: -1.4, "font-size": 2.8, fill: "var(--danger)", "text-anchor": "middle" }, svg).textContent = "blind zone";
+  el("text", { x: 78, y: y(sz + (78 - sx) * Math.tan(half)) + 5, "font-size": 2.8, fill: "rgb(var(--beam))", "text-anchor": "middle" }, svg).textContent = "sonar beam";
+
+  // car silhouette
+  const car = el("g", {}, svg);
+  el("rect", { x: -G.body_length_cm / 2, y: y(6.7), width: G.body_length_cm, height: (6.7 - 1.8) * Z, rx: 1, fill: "var(--surface-3)", stroke: "var(--muted)", "vector-effect": "non-scaling-stroke" }, car);
+  el("rect", { x: -9, y: y(8.4), width: 18, height: 1.2 * Z, fill: "var(--surface-3)", stroke: "var(--muted)", "vector-effect": "non-scaling-stroke" }, car);
+  el("rect", { x: 7.6, y: y(13.4), width: 1.6, height: (13.4 - 7.9) * Z, fill: "var(--muted)" }, car);
+  el("rect", { x: sx - 1.2, y: y(sz + 1.3), width: 2.4, height: 2.6 * Z, rx: .6, fill: "rgb(var(--beam))" }, car);
+  el("rect", { x: cx - 1, y: y(cz + .9), width: 2, height: 1.8 * Z, rx: .5, fill: "var(--agent)" }, car);
+  for (const wx of [-G.wheel_x_cm, G.wheel_x_cm]) el("ellipse", { cx: wx, cy: y(G.wheel_radius_cm), rx: G.wheel_radius_cm, ry: G.wheel_radius_cm * Z, fill: "var(--faint)" }, car);
+  el("circle", { cx: G.line_x_cm, cy: y(0.4), r: .8, fill: "var(--ok)" }, car);
+
+  profileDist = el("g", {}, svg);
+  $("blind-note").innerHTML = `The sonar beam reaches the floor <b>${Math.round(floorHit - sx)} cm</b> ahead. At the ${25} cm stop distance it misses anything lower than <b>${minH.toFixed(1)} cm</b>. Flat objects on the floor are only visible if the camera points low enough.`;
+}
+let profileDist = null;
+function renderProfileDistance() {
+  if (!profileDist || !S) return;
+  profileDist.innerHTML = "";
+  const d = S.sensors.distance;
+  const centered = Math.abs(S.sensors.head - 90) <= 10;
+  if (d == null || d >= G.sonar_max_cm || !centered) return;
+  const x = G.sonar_x_cm + d;
+  if (x > 98) return;
+  const half = rad(G.sonar_cone_deg / 2);
+  const lo = Math.max(0, G.sonar_height_cm - d * Math.tan(half)), hi = G.sonar_height_cm + d * Math.tan(half);
+  el("line", { x1: x, y1: -lo * 2, x2: x, y2: -hi * 2, stroke: d < S.stop_cm ? "var(--danger)" : "var(--accent)", "stroke-width": 3, "stroke-linecap": "round", "vector-effect": "non-scaling-stroke" }, profileDist);
+}
+
+/* ---------- camera HUD ---------- */
+function renderHud() {
+  const svg = $("hud-svg"); svg.innerHTML = "";
+  if (!G || !S) return;
+  const head = S.sensors.head - 90;
+  // head compass along the top
+  const cx = 200, w = 150, top = 20;
+  el("line", { x1: cx - w / 2, y1: top, x2: cx + w / 2, y2: top, stroke: "rgb(255 255 255 / .45)", "stroke-width": 1, "vector-effect": "non-scaling-stroke" }, svg);
+  for (const a of [-80, -40, 0, 40, 80]) {
+    const x = cx - (a / 80) * (w / 2);
+    el("line", { x1: x, y1: top - (a === 0 ? 6 : 3), x2: x, y2: top + (a === 0 ? 6 : 3), stroke: "rgb(255 255 255 / .7)", "vector-effect": "non-scaling-stroke" }, svg);
+  }
+  const hx = cx - (head / 80) * (w / 2);
+  el("path", { d: `M ${hx} ${top + 4} l -5 8 h 10 z`, fill: "var(--accent)" }, svg);
+  const ht = el("text", { x: cx, y: top + 26, fill: "rgb(255 255 255 / .9)", "font-size": 10.5, "text-anchor": "middle", style: "paint-order: stroke; stroke: rgb(0 0 0 / .55); stroke-width: 3px" }, svg);
+  ht.textContent = head === 0 ? "head center" : `head ${Math.abs(head)}° ${head > 0 ? "left" : "right"}`;
+  const L = el("text", { x: cx - w / 2 - 6, y: top + 3.5, fill: "rgb(255 255 255 / .8)", "font-size": 10, "text-anchor": "end" }, svg); L.textContent = "L";
+  const R = el("text", { x: cx + w / 2 + 6, y: top + 3.5, fill: "rgb(255 255 255 / .8)", "font-size": 10 }, svg); R.textContent = "R";
+
+  // where the sonar points inside the image (aligned with the camera, below it by the camera's tilt)
+  const fx = 200;
+  const fy = 150 + (G.camera_tilt_deg / G.camera_vfov_deg) * 300;
+  const rx = (G.sonar_cone_deg / G.camera_hfov_deg) * 400 / 2;
+  const ry = (G.sonar_cone_deg / G.camera_vfov_deg) * 300 / 2;
+  const d = S.sensors.distance;
+  const danger = d != null && d < S.stop_cm;
+  const color = danger ? "var(--danger)" : "rgb(255 255 255 / .9)";
+  el("ellipse", { cx: fx, cy: fy, rx, ry, fill: danger ? "rgb(255 77 79 / .14)" : "rgb(255 255 255 / .06)", stroke: color, "stroke-width": 1.5, "stroke-dasharray": "5 4", "vector-effect": "non-scaling-stroke" }, svg);
+  el("line", { x1: fx - 7, y1: fy, x2: fx + 7, y2: fy, stroke: color, "vector-effect": "non-scaling-stroke" }, svg);
+  el("line", { x1: fx, y1: fy - 7, x2: fx, y2: fy + 7, stroke: color, "vector-effect": "non-scaling-stroke" }, svg);
+  const read = $("hud-read");
+  read.style.left = "50%";
+  read.style.top = `${((fy - ry) / 300) * 100}%`;
+  read.style.transform = "translate(-50%, calc(-100% - 6px))";
+  $("hud-dist").textContent = d == null ? "--" : d >= G.sonar_max_cm ? "clear" : `${d} cm`;
+  $("hud-dist").style.color = danger ? "#ff6b6d" : "#fff";
+}
+
+/* ---------- render ---------- */
+function render(state) {
+  S = state;
+  const s = state.sensors;
+
+  const link = state.link.state;
+  $("link-dot").className = "dot " + (link === "online" ? "ok" : link === "offline" ? "bad" : "warn");
+  $("link-txt").textContent = link === "online" ? `online${state.link.rtt_ms != null ? ` · ${state.link.rtt_ms} ms` : ""}` : link;
+  $("chip-link").title = state.link.error || "";
+
+  const st = state.agent.state;
+  const labels = { initializing: "starting", idle: "idle", listening: "listening", thinking: "thinking", speaking: "speaking" };
+  $("agent-txt").textContent = labels[st] || st;
+  $("agent-dot").className = "dot " + (st === "speaking" ? "agent pulse" : st === "thinking" ? "warn pulse" : st === "listening" ? "ok" : "");
+  $("agent-sub").textContent = state.agent.user_state === "speaking" ? "you are speaking" : "";
+  $("t-auto").setAttribute("aria-checked", state.agent.autonomy);
+  $("t-mic").setAttribute("aria-checked", state.agent.mic);
+
+  if (state.frame.id && state.frame.id !== lastFrameId) {
+    lastFrameId = state.frame.id;
+    frameTimes.push(performance.now());
+    while (frameTimes.length > 6) frameTimes.shift();
+    if (camSource === "agent") $("cam-img").src = `/frame.jpg?id=${lastFrameId}`;
+  }
+  const age = state.frame.t ? state.now - state.frame.t : null;
+  const camOk = age != null && age < 4;
+  $("cam-dot").className = "dot " + (camOk ? "ok" : age == null ? "" : "bad");
+  $("cam-txt").textContent = age == null ? "waiting" : camOk ? (camSource === "live" && !streamFailed ? "live" : `${age.toFixed(1)} s old`) : "no frames";
+
+  $("m-dist").textContent = s.distance == null ? "--" : s.distance >= (G ? G.sonar_max_cm : 150) ? "clear" : `${s.distance} cm`;
+  $("m-dist").style.color = s.distance != null && s.distance < state.stop_cm ? "var(--danger)" : "";
+  const head = s.head - 90;
+  const headTxt = head === 0 ? "center" : `${Math.abs(head)}° ${head > 0 ? "left" : "right"}`;
+  $("m-head").textContent = headTxt;
+  $("m-rtt").textContent = state.link.rtt_ms == null ? "--" : `${state.link.rtt_ms} ms`;
+
+  const m = state.motion;
+  const verb = { forward: "forward", back: "backing up", left: "spinning left", right: "spinning right" }[m.dir];
+  $("who").innerHTML = m.dir ? `<b>${m.by === "human" ? "You" : "Agent"}</b> ${verb}` : "Nobody is driving";
+  const who = $("hud-who");
+  who.hidden = !m.dir;
+  if (m.dir) who.textContent = `${m.by === "human" ? "You" : "Agent"}: ${verb}`;
+
+  if (G && s.line) {
+    const thr = G.line_threshold, top = 1023;
+    const lifted = s.line.every((v) => v > thr);
+    [["f-l", "f-lv", "L"], ["f-m", "f-mv", "M"], ["f-r", "f-rv", "R"]].forEach(([f, v, n], i) => {
+      const val = s.line[i];
+      $(f).style.height = `${Math.min(100, (val / top) * 100)}%`;
+      $(f).classList.toggle("off", val > thr);
+      $(v).textContent = `${n} ${val}`;
+    });
+    document.querySelectorAll(".meter .thr").forEach((t) => (t.style.bottom = `${(thr / top) * 100}%`));
+    $("f-state").textContent = lifted ? "No floor" : "On the floor";
+    $("f-state").style.color = lifted ? "var(--danger)" : "var(--ok)";
+  }
+
+  renderConvo(state.transcript);
+  renderTools(state.tools);
+  for (const n of state.notices) if (!shownToasts.has(n.id)) { shownToasts.add(n.id); if (state.now - n.t < 5) toast(n.text, n.level); }
+
+  renderRadar();
+  renderProfileDistance();
+  renderHud();
+}
+
+let convoKey = "";
+function renderConvo(items) {
+  const key = items.map((i) => `${i.id}:${i.text.length}:${i.final}`).join("|");
+  if (key === convoKey) return;
+  convoKey = key;
+  const box = $("convo");
+  const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
+  box.innerHTML = "";
+  if (!items.length) { box.innerHTML = '<p class="empty-note">The conversation appears here.</p>'; return; }
+  for (const i of items) {
+    const d = document.createElement("div");
+    d.className = `msg ${i.role}${i.final ? "" : " interim"}`;
+    const w = document.createElement("span"); w.className = "who-l"; w.textContent = i.role === "user" ? "You" : "Elegoo";
+    d.append(w, document.createTextNode(i.text));
+    box.appendChild(d);
+  }
+  if (atBottom) box.scrollTop = box.scrollHeight;
+}
+
+let toolsKey = "";
+function renderTools(items) {
+  const key = items.map((i) => `${i.id}:${i.status}`).join("|");
+  if (key === toolsKey) return;
+  toolsKey = key;
+  const ul = $("tools"); ul.innerHTML = "";
+  if (!items.length) { ul.innerHTML = '<li class="empty-note">Tool calls appear here.</li>'; return; }
+  for (const i of items.slice().reverse()) {
+    const li = document.createElement("li"); li.className = "tool";
+    const icon = { running: "i-loader", done: "i-check", error: "i-alert" }[i.status];
+    const dur = i.t1 ? `${(i.t1 - i.t0).toFixed(1)} s` : "running";
+    li.innerHTML = `<svg class="ico ${i.status}" width="15" height="15"><use href="#${icon}"/></svg><span></span><span class="t num">${dur}</span>${i.result ? '<span class="res"></span>' : ""}`;
+    li.children[1].textContent = i.label;
+    if (i.result) li.querySelector(".res").textContent = i.result;
+    ul.appendChild(li);
+  }
+}
+
+function toast(text, level = "info") {
+  const t = document.createElement("div");
+  t.className = `toast ${level}`; t.textContent = text;
+  $("toasts").appendChild(t);
+  setTimeout(() => { t.style.opacity = 0; setTimeout(() => t.remove(), 450); }, 4000);
+}
+
+connect();
+</script>
+</body>
+</html>

@@ -2,6 +2,7 @@
 
 Run on the Mac (mic + speakers):  .venv/bin/python agent.py console
 Type instead of talking:          .venv/bin/python agent.py console --text
+Control pane (see + drive):       http://localhost:8765 while the agent runs
 
 Gemini Live hears the mic, watches the car camera (about one frame per second)
 and drives through the tools below. Every move is a short timed command that
@@ -25,11 +26,14 @@ from livekit.plugins import google
 from PIL import Image
 
 import behaviors
+from dashboard import Dashboard, Pilot, Recorder, Telemetry
 from robot import DEFAULT_HOST, Robot
 
 HOST = os.environ.get("CAR_HOST", DEFAULT_HOST)
 PORT = int(os.environ.get("CAR_PORT", "100"))
 CAMERA_URL = os.environ.get("CAR_CAMERA_URL", f"http://{HOST}/capture")
+STREAM_URL = os.environ.get("CAR_STREAM_URL", f"http://{HOST}:81/stream")
+DASHBOARD_PORT = int(os.environ.get("DASHBOARD_PORT", "8765"))
 MODEL = os.environ.get("GEMINI_LIVE_MODEL", "gemini-3.8-live")
 LOCATION = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")  # Live is not served on "global"
 VOICE = os.environ.get("GEMINI_VOICE", "Puck")
@@ -41,6 +45,9 @@ STEP_MS = 200  # forward moves run in steps this long, checking range and floor 
 STOP_CM = 25
 SETTLE_S = 1.2  # let a fresh camera frame reach the model after moving
 REPEAT_S = 3.0  # Gemini Live sometimes re-issues the move it just made; an identical move this soon is dropped once
+MANUAL_SPEED = 150
+HUMAN_HOLD_S = 1.5  # after the human touches the controls, the agent keeps its wheels still this long
+RECONNECT_S = 3.0
 
 log = logging.getLogger("car-agent")
 
@@ -76,9 +83,10 @@ def _fetch(url, timeout=3.0):
 
 
 class CarCamera(VideoInput):
-    def __init__(self, url, fps=1.0):
+    def __init__(self, url, telemetry, fps=1.0):
         super().__init__(label="car-camera")
         self._url = url
+        self._telemetry = telemetry
         self._period = 1.0 / fps
         self._next = 0.0
         self._failing = False
@@ -99,26 +107,68 @@ class CarCamera(VideoInput):
             if self._failing:
                 log.info("camera back")
                 self._failing = False
-            img = Image.open(io.BytesIO(jpeg)).rotate(180).convert("RGBA")  # camera module is mounted upside down
+            img = Image.open(io.BytesIO(jpeg)).rotate(180)  # camera module is mounted upside down
+            upright = io.BytesIO()
+            img.save(upright, "JPEG", quality=90)
+            self._telemetry.set_frame(upright.getvalue())
+            img = img.convert("RGBA")
             return rtc.VideoFrame(img.width, img.height, rtc.VideoBufferType.RGBA, img.tobytes())
 
 
 class Car:
-    def __init__(self, host, port):
+    def __init__(self, host, port, telemetry):
         self.host = host
         self.port = port
+        self.telemetry = telemetry
         self._robot = None
         self._lock = threading.Lock()
+        self._retry_at = 0.0
+        self._human_at = 0.0
 
-    def run(self, fn):
+    def human_input(self):
+        self._human_at = time.monotonic()
+
+    def human_active(self):
+        return time.monotonic() - self._human_at < HUMAN_HOLD_S
+
+    def _call(self, fn, by):
+        try:
+            if self._robot is None:
+                self._robot = Robot.wifi(self.host, self.port)
+            return fn(Recorder(self._robot, self.telemetry, by))
+        except (OSError, TimeoutError) as e:
+            self._drop()
+            self._retry_at = time.monotonic() + RECONNECT_S
+            self.telemetry.link.update(state="offline", error=str(e))
+            self.telemetry.touch()
+            raise
+
+    def run(self, fn, by="agent"):
         with self._lock:
             try:
-                if self._robot is None:
-                    self._robot = Robot.wifi(self.host, self.port)
-                return fn(self._robot)
+                return self._call(fn, by)
             except (OSError, TimeoutError) as e:
-                self._drop()
                 raise ToolError(f"I can't reach my wheels right now ({e}).") from e
+
+    def run_quiet(self, fn, by="human"):
+        with self._lock:
+            return self._quiet(fn, by)
+
+    def try_run(self, fn):
+        if not self._lock.acquire(blocking=False):
+            return None
+        try:
+            return self._quiet(fn, None)
+        finally:
+            self._lock.release()
+
+    def _quiet(self, fn, by):
+        if self._robot is None and time.monotonic() < self._retry_at:
+            return None
+        try:
+            return self._call(fn, by)
+        except (OSError, TimeoutError):
+            return None
 
     def _drop(self):
         robot, self._robot = self._robot, None
@@ -133,12 +183,14 @@ class Car:
             self._drop()
 
 
-def _forward(robot, cm):
+def _forward(robot, cm, human_active):
     robot.head(behaviors.CENTER)
     time.sleep(0.3)
     total_ms = int(cm / CM_PER_S * 1000)
     done_ms = 0
     while done_ms < total_ms:
+        if human_active():
+            return f"Stopped after about {done_ms * CM_PER_S / 1000:.0f} cm: the human took over the controls."
         if not robot.on_ground():
             return f"Stopped after about {done_ms * CM_PER_S / 1000:.0f} cm: no floor under my front sensors (an edge, or I am lifted)."
         ahead = robot.distance()
@@ -175,18 +227,33 @@ class CarAgent(Agent):
     def __init__(self, car):
         super().__init__(instructions=INSTRUCTIONS)
         self.car = car
+        self.telemetry = car.telemetry
         self._last_move = None
 
-    async def _drive(self, move, fn):
+    async def _drive(self, label, move, fn):
+        if not self.telemetry.agent["autonomy"]:
+            return self._refuse(label, "Not moved: the human has paused my driving from the control pane.")
+        if self.car.human_active():
+            return self._refuse(label, "Not moved: the human is driving me right now. Wait and watch the camera.")
         last, self._last_move = self._last_move, None
         if last and last[0] == move and time.monotonic() - last[1] < REPEAT_S:
-            return "Skipped: that exact move just finished. Look at the camera view; if you still want it, call it again."
-        result = await self._act(fn)
+            return self._refuse(label, "Skipped: that exact move just finished. Look at the camera view; if you still want it, call it again.")
+        result = await self._act(label, fn)
         self._last_move = (move, time.monotonic())
         return result
 
-    async def _act(self, fn, settle=True):
-        result = await asyncio.to_thread(self.car.run, fn)
+    def _refuse(self, label, reason):
+        self.telemetry.tool_end(self.telemetry.tool_start(label), reason, ok=False)
+        return reason
+
+    async def _act(self, label, fn, settle=True):
+        entry = self.telemetry.tool_start(label)
+        try:
+            result = await asyncio.to_thread(self.car.run, fn)
+        except ToolError as e:
+            self.telemetry.tool_end(entry, str(e), ok=False)
+            raise
+        self.telemetry.tool_end(entry, result)
         if settle:
             await asyncio.sleep(SETTLE_S)
         return result
@@ -199,7 +266,7 @@ class CarAgent(Agent):
             centimeters: distance to drive, 5 to 100.
         """
         cm = max(5, min(100, centimeters))
-        return await self._drive(("forward", cm), lambda r: _forward(r, cm))
+        return await self._drive(f"Drive forward {cm} cm", ("forward", cm), lambda r: _forward(r, cm, self.car.human_active))
 
     @function_tool()
     async def drive_back(self, centimeters: int) -> str:
@@ -209,7 +276,7 @@ class CarAgent(Agent):
             centimeters: distance to back up, 5 to 40.
         """
         cm = max(5, min(40, centimeters))
-        return await self._drive(("back", cm), lambda r: _back(r, cm))
+        return await self._drive(f"Back up {cm} cm", ("back", cm), lambda r: _back(r, cm))
 
     @function_tool()
     async def turn(self, direction: Literal["left", "right"], degrees: int) -> str:
@@ -220,7 +287,7 @@ class CarAgent(Agent):
             degrees: how far to spin, 5 to 180.
         """
         deg = max(5, min(180, abs(degrees))) * (1 if direction == "left" else -1)
-        return await self._drive(("turn", deg), lambda r: _turn(r, deg))
+        return await self._drive(f"Turn {direction} {abs(deg)}°", ("turn", deg), lambda r: _turn(r, deg))
 
     @function_tool()
     async def look_direction(self, direction: Literal["left", "right", "forward"], degrees: int = 45) -> str:
@@ -231,26 +298,69 @@ class CarAgent(Agent):
             degrees: how far from straight ahead, 10 to 80. Ignored for forward.
         """
         deg = 0 if direction == "forward" else max(10, min(80, abs(degrees))) * (1 if direction == "left" else -1)
-        return await self._act(lambda r: _look(r, deg))
+        label = "Look forward" if deg == 0 else f"Look {direction} {abs(deg)}°"
+        return await self._act(label, lambda r: _look(r, deg))
 
     @function_tool()
     async def scan_distances(self) -> str:
         """Sweep the head left to right and measure free space in each direction, in cm."""
-        return await self._act(_scan, settle=False)
+        return await self._act("Scan distances", _scan, settle=False)
 
     @function_tool()
     async def stop(self) -> str:
         """Stop all motion immediately."""
-        await self._act(lambda r: r.stop(), settle=False)
+        await self._act("Stop", lambda r: r.stop(), settle=False)
         return "Stopped."
 
 
 server = AgentServer()
 
 
+class PaneActions:
+    def __init__(self, session, telemetry):
+        self.session = session
+        self.telemetry = telemetry
+
+    async def estop(self):
+        self.telemetry.agent["autonomy"] = False
+        await self.session.interrupt(force=True)
+
+    def set_mic(self, on):
+        self.session.input.set_audio_enabled(on)
+        self.telemetry.agent["mic"] = on
+
+    def say(self, text):
+        self.session.generate_reply(user_input=text)
+
+
+def _follow_session(session, telemetry):
+    def agent_state(ev):
+        telemetry.agent["state"] = ev.new_state
+        telemetry.touch()
+
+    def user_state(ev):
+        telemetry.agent["user_state"] = ev.new_state
+        telemetry.touch()
+
+    def heard(ev):
+        if ev.transcript.strip():
+            telemetry.say("user", ev.transcript, ev.is_final)
+
+    def item(ev):
+        role, text = getattr(ev.item, "role", None), getattr(ev.item, "text_content", None)
+        if role in ("user", "assistant") and text:
+            telemetry.say("user" if role == "user" else "agent", text)
+
+    session.on("agent_state_changed", agent_state)
+    session.on("user_state_changed", user_state)
+    session.on("user_input_transcribed", heard)
+    session.on("conversation_item_added", item)
+
+
 @server.rtc_session()
 async def entrypoint(ctx: agents.JobContext):
-    car = Car(HOST, PORT)
+    telemetry = Telemetry(STOP_CM)
+    car = Car(HOST, PORT, telemetry)
     ctx.add_shutdown_callback(lambda: asyncio.to_thread(car.close))
     session = AgentSession(
         llm=google.realtime.RealtimeModel(
@@ -261,8 +371,12 @@ async def entrypoint(ctx: agents.JobContext):
             language="en-US",
         ),
     )
+    _follow_session(session, telemetry)
     await session.start(room=ctx.room, agent=CarAgent(car))
-    session.input.video = CarCamera(CAMERA_URL)
+    session.input.video = CarCamera(CAMERA_URL, telemetry)
+    pane = Dashboard(telemetry, Pilot(car, telemetry, MANUAL_SPEED, behaviors.scan), PaneActions(session, telemetry), STREAM_URL, DASHBOARD_PORT)
+    await pane.start()
+    ctx.add_shutdown_callback(pane.close)
     await session.generate_reply(instructions="Say a short hello and that you can look around, find people, and find things.")
 
 
