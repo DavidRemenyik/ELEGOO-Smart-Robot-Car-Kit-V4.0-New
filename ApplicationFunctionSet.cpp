@@ -356,8 +356,9 @@ void ApplicationFunctionSet::analyzeSerialData(const JsonDocument &doc) {
         case 5: // Servo control / 舵机控制
             {
                 currentState = State::DoNothing;
-                uint8_t angle = doc["D2"].as<uint8_t>() / 10;
-                AppServo.control(angle, 0);
+                // D2 is the head angle in degrees (90 = ahead). setZAngle keeps the servo powered so it
+                // finishes the move without blocking the command loop.
+                AppServo.setZAngle(constrain(doc["D2"].as<int>(), 0, 180));
                 sendCommandResponse(true);
             }
             break;
