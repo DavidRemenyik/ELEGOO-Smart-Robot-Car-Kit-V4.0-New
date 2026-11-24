@@ -176,9 +176,12 @@ static void startWifi() {
   WiFi.begin(HOME_WIFI_SSID, HOME_WIFI_PASSWORD);
   uint32_t start = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) delay(250);
-  if (WiFi.status() == WL_CONNECTED)
+  if (WiFi.status() == WL_CONNECTED) {
+    // The fallback AP shares the one radio and modem sleep delays every packet: both stall the camera stream.
+    WiFi.softAPdisconnect(true);
+    WiFi.setSleep(false);
     Serial.printf("joined %s as %s\n", HOME_WIFI_SSID, WiFi.localIP().toString().c_str());
-  else
+  } else
     Serial.printf("could not join %s yet; retrying in background\n", HOME_WIFI_SSID);
 }
 
