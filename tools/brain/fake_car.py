@@ -146,7 +146,7 @@ class Car:
             return self.x, self.y, self.heading, self.head
 
     def status(self):
-        return f"{round(self.heading * 10)},{int(not self.lifted)}"
+        return f"{round(-self.heading * 10)},{int(not self.lifted)}"  # like the firmware: yaw grows clockwise
 
     def test_state(self):
         with self.lock:
@@ -161,15 +161,16 @@ class Car:
         with self.lock:
             self._advance()
             if n == 4:
-                # robot.py sends D1 = right wheels, D2 = left wheels
-                right = max(-255, min(255, int(msg.get("D1", 0))))
-                left = max(-255, min(255, int(msg.get("D2", 0))))
+                # like the firmware: D1 = left wheels, D2 = right wheels
+                left = max(-255, min(255, int(msg.get("D1", 0))))
+                right = max(-255, min(255, int(msg.get("D2", 0))))
                 self._set_wheels(left, right, "N=4")
                 self.last_wheels = time.monotonic()
                 return self.status()
             if n == 3:
                 speed = max(0, min(255, int(msg.get("D2", 0))))
-                left, right = {1: (speed, -speed), 2: (-speed, speed), 3: (speed, speed),
+                # Like the real firmware: code 1 spins left, 2 spins right.
+                left, right = {1: (-speed, speed), 2: (speed, -speed), 3: (speed, speed),
                                4: (-speed, -speed)}.get(msg.get("D1"), (0, 0))
                 self._set_wheels(left, right, "manual")
                 self.last_wheels = math.inf  # N=3 stays active until an explicit stop
@@ -424,7 +425,7 @@ async def serve_client(car, reader, writer):
                 await writer.drain()
                 x, y, heading, head = car.pose()
                 args = " ".join(f"{k}={v}" for k, v in msg.items() if k not in ("H", "N"))
-                wheels = f" L={msg.get('D2')} R={msg.get('D1')}" if msg.get("N") == 4 else ""
+                wheels = f" L={msg.get('D1')} R={msg.get('D2')}" if msg.get("N") == 4 else ""
                 log(f"N={msg.get('N')} {args}{wheels} -> {reply}  pose x={x:.1f} y={y:.1f} heading={heading:.1f} head={head}")
     except (ConnectionError, OSError) as e:
         log(f"client {peer} error: {e}")
