@@ -18,7 +18,7 @@ log = logging.getLogger("car-dashboard")
 PAGE = Path(__file__).with_name("dashboard.html")
 HEAD_CENTER = 90
 HEAD_MIN, HEAD_MAX = 10, 170
-HEAD_STEP = 6
+HEAD_STEP = 15  # each servo command takes ~0.5 s on the car, so small steps crawl
 SONAR_KEEP_S = 8.0
 POLL_S = 0.12
 WATCHDOG_S = 0.4  # manual drive stops when the browser stops confirming the key is held
@@ -170,6 +170,17 @@ class Recorder:
             self._timed(self._robot.move, direction, speed, ms)
         finally:
             self._t.moved(None, None)
+
+    def wheels(self, left, right):
+        if not (left or right):
+            direction = None
+        elif (left > 0) == (right > 0):
+            direction = "forward" if left > 0 else "back"
+        else:
+            direction = "left" if right > left else "right"
+        if direction != self._t.motion["dir"]:
+            self._t.moved(self._by if direction else None, direction)
+        return self._timed(self._robot.wheels, left, right)
 
     def stop(self):
         self._timed(self._robot.stop)
