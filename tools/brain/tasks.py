@@ -330,9 +330,16 @@ def find_object(r: SafeDrive, vision: Vision, query: Callable[[bytes], Awaitable
     driver = Driver(r)
     r.vote_while_driving = True
     travel = 0.0
+    failures = 0  # consecutive views the model gave no usable answer for
+
+    def unanswered(reason: str) -> None:
+        nonlocal failures
+        failures += 1
+        if failures >= 2:
+            raise EndTask(reason)
 
     def look() -> Person | None:
-        nonlocal budget
+        nonlocal budget, failures
         r.wait(0.27)
         if budget <= 0 or time.monotonic() >= deadline:
             raise EndTask(f"I couldn't confirm {name} within my search limit")
@@ -352,11 +359,14 @@ def find_object(r: SafeDrive, vision: Vision, query: Callable[[bytes], Awaitable
                     result = future.result(timeout=0.04)
                 except FutureTimeout:
                     if future.done():
-                        raise EndTask("object vision timed out") from None
+                        unanswered("object vision timed out")
+                        return None
                     continue
                 except (errors.APIError, OSError, ValidationError) as e:
                     log.warning("Object vision request failed: %s", e)
-                    raise EndTask("object vision did not return a usable answer") from e
+                    unanswered("object vision did not return a usable answer")
+                    return None
+                failures = 0
                 if result.box:
                     y0, x0, y1, x1 = result.box
                     if 0 <= x0 < x1 <= 1000 and 0 <= y0 < y1 <= 1000:
