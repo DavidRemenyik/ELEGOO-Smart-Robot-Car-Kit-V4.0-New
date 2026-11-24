@@ -1,29 +1,40 @@
-"""Talking, seeing robot: LiveKit Agents + Gemini Live (Vertex AI) driving the car.
+"""Talking, seeing robot: LiveKit Agents driving the car with an STT -> LLM -> TTS pipeline.
 
 Run on the Mac (mic + speakers):  .venv/bin/python agent.py console
 Type instead of talking:          .venv/bin/python agent.py console --text
 Control pane (see + drive):       http://localhost:8765 while the agent runs
+Without the car:                  .venv/bin/python fake_car.py --port 18100 --camera-port 18101
+                                  CAR_HOST=127.0.0.1 CAR_PORT=18100 \
+                                  CAR_CAMERA_URL=http://127.0.0.1:18101/capture \
+                                  CAR_STREAM_URL=http://127.0.0.1:18101/stream .venv/bin/python agent.py console --text
 
-Gemini Live hears the mic, watches the car camera (about one frame per second)
-and picks the moves; drive.py steers each move from the Mac with the gyro and
-range sensor. The firmware stops the wheels when commands stop arriving, and
-forward moves stop when the ultrasonic sensor sees something closer than STOP_CM.
+Pipeline: Google Cloud Speech-to-Text hears the mic, Gemini on Vertex AI (project from
+GOOGLE_CLOUD_PROJECT, default agrointel-dd8f6, via gcloud application-default credentials)
+reads the words plus a fresh car camera picture on every turn and picks the moves, and
+ElevenLabs speaks the reply (CAR_VOICE=google switches to Google Cloud TTS).
+The ElevenLabs key comes from ELEVENLABS_API_KEY / ELEVEN_API_KEY, else from Secret Manager
+(gcloud secrets versions access latest --secret=ELEVENLABS_API_KEY); it is kept in memory only.
+Other settings: GEMINI_MODEL, GEMINI_LOCATION, ELEVEN_VOICE_ID, ELEVEN_MODEL.
+
+drive.py steers each move from the Mac with the gyro and range sensor. The firmware stops the
+wheels when commands stop arriving, and forward moves stop when the ultrasonic sensor sees
+something closer than STOP_CM.
 """
 
 import asyncio
-import io
+import base64
 import logging
 import os
+import subprocess
 import threading
 import time
 import urllib.request
 from typing import Literal
 
-from livekit import agents, rtc
+from livekit import agents
 from livekit.agents import Agent, AgentServer, AgentSession, ToolError, function_tool
-from livekit.agents.voice.io import VideoInput
-from livekit.plugins import google
-from PIL import Image
+from livekit.agents.llm import ImageContent
+from livekit.plugins import elevenlabs, google, silero
 
 import behaviors
 from drive import Driver
@@ -35,9 +46,14 @@ PORT = int(os.environ.get("CAR_PORT", "100"))
 CAMERA_URL = os.environ.get("CAR_CAMERA_URL", f"http://{HOST}/capture")
 STREAM_URL = os.environ.get("CAR_STREAM_URL", f"http://{HOST}:81/stream")
 DASHBOARD_PORT = int(os.environ.get("DASHBOARD_PORT", "8765"))
-MODEL = os.environ.get("GEMINI_LIVE_MODEL", "gemini-3.8-live")
-LOCATION = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")  # Live is not served on "global"
-VOICE = os.environ.get("GEMINI_VOICE", "Puck")
+PROJECT = os.environ.get("GOOGLE_CLOUD_PROJECT", "agrointel-dd8f6")
+MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
+LOCATION = os.environ.get("GEMINI_LOCATION", "global")  # gemini-3.8-flash is not served in us-central1 for this project
+CAR_VOICE = os.environ.get("CAR_VOICE", "elevenlabs")
+ELEVEN_VOICE_ID = os.environ.get("ELEVEN_VOICE_ID", "cgSgspJ2msm6clMCkdW9")  # premade "Jessica - Playful, Bright, Warm"
+ELEVEN_MODEL = os.environ.get("ELEVEN_MODEL", "eleven_flash_v2_5")  # ElevenLabs' ultra-low-latency model
+GOOGLE_VOICE = os.environ.get("GOOGLE_TTS_VOICE", "en-US-Chirp3-HD-Puck")
+CAMERA_FPS = 1.0  # refresh rate of the control pane's still frame
 
 STOP_CM = 25
 SETTLE_S = 1.2  # let a fresh camera frame reach the model after moving
@@ -49,8 +65,12 @@ RECONNECT_S = 3.0
 log = logging.getLogger("car-agent")
 
 INSTRUCTIONS = """You are Elegoo, a small, friendly four-wheeled robot car. You talk out loud in English,
-in short, natural sentences. You see the world live through a camera on your head, mounted low,
-about 15 cm above the floor, so people usually look tall and you may only see their legs.
+in short, natural sentences, with no markdown, lists or emoji, because everything you write is spoken.
+You see the world through a camera on your head: each time you think, you get a fresh picture of what
+it sees right now. The camera sits low, about 15 cm above the floor, and points up at about 20 degrees,
+so you see ceilings, walls and the upper parts of things, people usually look tall and you may only see
+their legs, and the floor right in front of you is out of view: small things on the floor close by may
+not show, so trust the distance sensor and move reports for nearby obstacles.
 Your ears and voice are not on your body: the microphone and speaker are on a Mac computer. The
 person you talk with sits near the Mac and may be in a different spot, or a different room, than
 what your camera shows. Hearing someone clearly does not mean they are close to you.
@@ -86,37 +106,72 @@ def _fetch(url, timeout=3.0):
         return r.read()
 
 
-class CarCamera(VideoInput):
-    def __init__(self, url, telemetry, fps=1.0):
-        super().__init__(label="car-camera")
+def _eleven_key():
+    key = os.environ.get("ELEVENLABS_API_KEY") or os.environ.get("ELEVEN_API_KEY")
+    if key:
+        return key
+    cmd = ["gcloud", "secrets", "versions", "access", "latest", "--secret=ELEVENLABS_API_KEY", f"--project={PROJECT}"]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=30, check=True)
+    except subprocess.CalledProcessError as e:
+        raise SystemExit(f"Cannot read the ElevenLabs key from Secret Manager: {e.stderr.strip()}") from e
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise SystemExit(f"Cannot run gcloud to read the ElevenLabs key: {e}") from e
+    return out.stdout.strip()
+
+
+def make_tts():
+    if CAR_VOICE == "google":
+        return google.TTS(voice_name=GOOGLE_VOICE, language="en-US")
+    if CAR_VOICE != "elevenlabs":
+        raise SystemExit(f"CAR_VOICE must be elevenlabs or google, not {CAR_VOICE!r}")
+    return elevenlabs.TTS(voice_id=ELEVEN_VOICE_ID, model=ELEVEN_MODEL, api_key=_eleven_key())
+
+
+def make_llm():
+    return google.LLM(
+        vertexai=True,
+        project=PROJECT,
+        location=LOCATION,
+        model=MODEL,
+        thinking_config={"thinking_level": "low"},  # less thinking, sooner first word; "minimal" is refused by this model
+    )
+
+
+class CarCamera:
+    """Fetches a fresh camera still for every model turn and keeps the control pane's frame current."""
+
+    def __init__(self, url, telemetry):
         self._url = url
         self._telemetry = telemetry
-        self._period = 1.0 / fps
-        self._next = 0.0
         self._failing = False
+        self._task = None
 
-    async def __anext__(self) -> rtc.VideoFrame:
+    async def snapshot(self):
+        try:
+            jpeg = await asyncio.to_thread(_fetch, self._url)
+        except OSError as e:
+            if not self._failing:
+                log.warning("camera %s unreachable: %s", self._url, e)
+            self._failing = True
+            return None
+        if self._failing:
+            log.info("camera back")
+            self._failing = False
+        self._telemetry.set_frame(jpeg)
+        return jpeg
+
+    def start(self):
+        self._task = asyncio.create_task(self._refresh())
+
+    async def _refresh(self):
         while True:
-            delay = self._next - time.monotonic()
-            if delay > 0:
-                await asyncio.sleep(delay)
-            self._next = time.monotonic() + self._period
-            try:
-                jpeg = await asyncio.to_thread(_fetch, self._url)
-            except OSError as e:
-                if not self._failing:
-                    log.warning("camera %s unreachable: %s", self._url, e)
-                self._failing = True
-                continue
-            if self._failing:
-                log.info("camera back")
-                self._failing = False
-            img = Image.open(io.BytesIO(jpeg)).rotate(180)  # camera module is mounted upside down
-            upright = io.BytesIO()
-            img.save(upright, "JPEG", quality=90)
-            self._telemetry.set_frame(upright.getvalue())
-            img = img.convert("RGBA")
-            return rtc.VideoFrame(img.width, img.height, rtc.VideoBufferType.RGBA, img.tobytes())
+            await self.snapshot()
+            await asyncio.sleep(1.0 / CAMERA_FPS)
+
+    def close(self):
+        if self._task:
+            self._task.cancel()
 
 
 class Car:
@@ -230,12 +285,26 @@ def _scan(robot):
 
 
 class CarAgent(Agent):
-    def __init__(self, car):
+    def __init__(self, car, camera):
         super().__init__(instructions=INSTRUCTIONS)
         self.car = car
+        self.camera = camera
         self.telemetry = car.telemetry
         self._last_move = None
         self._exploring = None
+
+    async def llm_node(self, chat_ctx, tools, model_settings):
+        # Every model call, including the one right after a move, sees the camera as it is now.
+        # The picture goes into a copy of the context, so old frames never pile up in the history.
+        jpeg = await self.camera.snapshot()
+        chat_ctx = chat_ctx.copy()
+        if jpeg:
+            image = ImageContent(image="data:image/jpeg;base64," + base64.b64encode(jpeg).decode())
+            chat_ctx.add_message(role="user", content=["[Your camera view right now]", image])
+        else:
+            chat_ctx.add_message(role="user", content=["[Your camera is not answering right now; you cannot see.]"])
+        async for chunk in Agent.default.llm_node(self, chat_ctx, tools, model_settings):
+            yield chunk
 
     async def _end_exploring(self):
         if self._exploring and not self._exploring.done():
@@ -370,6 +439,7 @@ class PaneActions:
     def set_mic(self, on):
         self.session.input.set_audio_enabled(on)
         self.telemetry.agent["mic"] = on
+        self.telemetry.touch()
 
     def say(self, text):
         self.session.generate_reply(user_input=text)
@@ -404,18 +474,17 @@ async def entrypoint(ctx: agents.JobContext):
     telemetry = Telemetry(STOP_CM)
     car = Car(HOST, PORT, telemetry)
     ctx.add_shutdown_callback(lambda: asyncio.to_thread(car.close))
+    camera = CarCamera(CAMERA_URL, telemetry)
     session = AgentSession(
-        llm=google.realtime.RealtimeModel(
-            vertexai=True,
-            location=LOCATION,
-            model=MODEL,
-            voice=VOICE,
-            language="en-US",
-        ),
+        stt=google.STT(languages="en-US", model="latest_long"),
+        llm=make_llm(),
+        tts=make_tts(),
+        vad=silero.VAD.load(),
     )
     _follow_session(session, telemetry)
-    await session.start(room=ctx.room, agent=CarAgent(car))
-    session.input.video = CarCamera(CAMERA_URL, telemetry)
+    await session.start(room=ctx.room, agent=CarAgent(car, camera))
+    camera.start()
+    ctx.add_shutdown_callback(camera.close)
     pane = Dashboard(telemetry, Pilot(car, telemetry, MANUAL_SPEED, behaviors.scan), PaneActions(session, telemetry), STREAM_URL, DASHBOARD_PORT)
     await pane.start()
     ctx.add_shutdown_callback(pane.close)

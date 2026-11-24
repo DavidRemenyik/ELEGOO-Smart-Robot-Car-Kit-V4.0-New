@@ -1,4 +1,4 @@
 pyserial
 esptool
-livekit-agents[google]~=1.8
+livekit-agents[google,elevenlabs,silero]~=1.8
 pillow

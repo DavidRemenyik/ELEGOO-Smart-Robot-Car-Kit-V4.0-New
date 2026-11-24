@@ -6,3 +6,4 @@ build.log
 *.elf
 __pycache__/
 .venv/
+.env
