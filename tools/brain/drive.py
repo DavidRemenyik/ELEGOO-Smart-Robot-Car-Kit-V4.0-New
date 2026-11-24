@@ -54,6 +54,7 @@ STALLED = "I was pushing against something: my wheels turned but my camera view 
 # fake_car.py; set them from stall_probe.py recordings on the real car. Measurements: .omo/waves/p3/stall.md.
 STALL_MIN_PWM = 80  # straight drives slower than this are not judged (CREEP is 80)
 STALL_WINDOW_S = 1.2  # the votes must hold this long
+STALL_PAUSE_S = 3.0  # a stop shorter than this (patrol's flank check) continues the same straight drive
 ONE_SIGN_S = 2.5  # GUESS: a still picture, or a steady range reading, this long with no sign of motion
 STALL_MIN_FRAMES = 5  # fresh frames needed inside the window (the real camera gives about 11 a second)
 STALL_FRAME_AGE_S = 0.4  # with no frame newer than this the camera counts as stalled
@@ -147,6 +148,7 @@ class StallWatch:
         self._ranges = deque()  # (time, cm) with the head facing ahead
         self._picture_vote, self._picture_since, self._range_since = None, None, None
         self.still_since = None
+        self._paused_at = None  # when the current straight drive last stopped, see wheels()
 
     def stalled(self):
         return STALLED if self.still_since is not None else None
@@ -158,13 +160,20 @@ class StallWatch:
     def wheels(self, left, right, heading, head):
         """Judge after a wheel command; True when a stall is newly found. Only straight drives count."""
         sign = (left > 0 and right > 0) - (left < 0 and right < 0)
-        if not sign or abs(left + right) / 2 < STALL_MIN_PWM:
-            self._clear()
-            return False
         now = time.monotonic()
-        if sign != self._sign:
+        if not sign or abs(left + right) / 2 < STALL_MIN_PWM:
+            # Patrol stops between short legs to look at both flanks; a short pause keeps the evidence, so
+            # pushing that goes on across legs adds up instead of starting from nothing each leg. A reported
+            # stall is cleared at once, so the back-off that follows is not stopped by it.
+            if self.still_since is not None:
+                self._clear()
+            elif self._paused_at is None:
+                self._paused_at = now
+            return False
+        if sign != self._sign or (self._paused_at is not None and now - self._paused_at > STALL_PAUSE_S):
             self._clear()
             self._sign, self._began = sign, now
+        self._paused_at = None
         if self.still_since is not None or self.camera is None:
             return False
         frame = self.camera.newest(STALL_FRAME_AGE_S)
