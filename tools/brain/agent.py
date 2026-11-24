@@ -62,8 +62,7 @@ GOOGLE_VOICE = os.environ.get("GOOGLE_TTS_VOICE", "en-US-Chirp3-HD-Puck")
 CAMERA_FPS = 1.0  # refresh rate of the control pane's still frame
 
 STOP_CM = 25
-SETTLE_S = 1.2  # let a fresh camera frame reach the model after moving
-REPEAT_S = 3.0  # Gemini Live sometimes re-issues the move it just made; an identical move this soon is dropped once
+SETTLE_S = 0.4  # let the car and the head come to rest before the model's next picture
 MANUAL_SPEED = 150
 HUMAN_HOLD_S = 1.5  # after the human touches the controls, the agent keeps its wheels still this long
 RECONNECT_S = 3.0
@@ -291,7 +290,6 @@ class CarAgent(Agent):
         self.car = car
         self.camera = camera
         self.telemetry = car.telemetry
-        self._last_move = None
         self.jobs = TaskManager(car, Vision(camera._url), self._speak_task)
         self.object_model = ObjectModel(PROJECT, LOCATION, MODEL)
 
@@ -317,17 +315,13 @@ class CarAgent(Agent):
         async for chunk in Agent.default.llm_node(self, chat_ctx, tools, model_settings):
             yield chunk
 
-    async def _drive(self, label, move, fn):
+    async def _drive(self, label, fn):
         if not self.telemetry.agent["autonomy"]:
             return self._refuse(label, "Not moved: the human has paused my driving from the control pane.")
         if self.car.human_active():
             return self._refuse(label, "Not moved: the human is driving me right now. Wait and watch the camera.")
-        last, self._last_move = self._last_move, None
-        if last and last[0] == move and time.monotonic() - last[1] < REPEAT_S:
-            return self._refuse(label, "Skipped: that exact move just finished. Look at the camera view; if you still want it, call it again.")
         result = await self.jobs.dispatch(label, fn, background=False)
         await asyncio.sleep(SETTLE_S)
-        self._last_move = (move, time.monotonic())
         return result
 
     def _refuse(self, label, reason):
@@ -342,7 +336,7 @@ class CarAgent(Agent):
             centimeters: distance to drive, 5 to 300.
         """
         cm = max(5, min(300, centimeters))
-        return await self._drive(f"Drive forward {cm} cm", ("forward", cm), lambda r: _forward(r, cm))
+        return await self._drive(f"Drive forward {cm} cm", lambda r: _forward(r, cm))
 
     @function_tool()
     async def drive_back(self, centimeters: int) -> str:
@@ -352,7 +346,7 @@ class CarAgent(Agent):
             centimeters: distance to back up, 5 to 40.
         """
         cm = max(5, min(40, centimeters))
-        return await self._drive(f"Back up {cm} cm", ("back", cm), lambda r: _back(r, cm))
+        return await self._drive(f"Back up {cm} cm", lambda r: _back(r, cm))
 
     @function_tool()
     async def turn(self, direction: Literal["left", "right"], degrees: int) -> str:
@@ -363,7 +357,7 @@ class CarAgent(Agent):
             degrees: how far to spin, 5 to 180.
         """
         deg = max(5, min(180, abs(degrees))) * (1 if direction == "left" else -1)
-        return await self._drive(f"Turn {direction} {abs(deg)}°", ("turn", deg), lambda r: _turn(r, deg))
+        return await self._drive(f"Turn {direction} {abs(deg)}°", lambda r: _turn(r, deg))
 
     @function_tool()
     async def explore(self, seconds: int) -> str:
@@ -440,7 +434,6 @@ class CarAgent(Agent):
     @function_tool()
     async def stop(self) -> str:
         """Stop all motion immediately."""
-        self._last_move = None
         return await self.jobs.stop("I was told to stop")
 
 
