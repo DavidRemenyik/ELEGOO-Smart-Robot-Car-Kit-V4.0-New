@@ -204,10 +204,7 @@ def plan_trip(place: str, start_room: str | None, where: Whereabouts) -> Trip:
     else:
         h = home()
         start, how = (h.x, h.y, h.yaw), "home" + (" (a placeholder spot until home is set)" if h.placeholder else "")
-    nav = Navigator(goal, floor().area(*start[:2]) or None, driver=DRIVER)
-    # A known start: replace the navigator's room prior with the pose prior (Localizer.reset's own option).
-    nav.loc.reset(pose=start)
-    return Trip(label, goal, nav, how)
+    return Trip(label, goal, Navigator(goal, start_pose=start, driver=DRIVER), how)
 
 
 def _decode(jpeg: bytes) -> np.ndarray:

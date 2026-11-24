@@ -82,6 +82,8 @@ SNAPSHOT_WAIT_S = 6.0  # how long a model turn waits for the camera before going
 STOP_CM = 25
 ENDPOINT_MIN_S = 0.9  # silence before a turn counts as finished; shorter cut the speaker off mid-sentence
 SETTLE_S = 0.4  # let the car and the head come to rest before the model's next picture
+ECHO_GUARD = os.environ.get("CAR_ECHO_GUARD", "1") != "0"  # mic off while speaking; 0 with headphones to allow barge-in
+ECHO_TAIL_S = 0.6  # room echo after the last word
 MANUAL_SPEED = 150
 HUMAN_HOLD_S = 1.5  # after the human touches the controls, the agent keeps its wheels still this long
 RECONNECT_S = 3.0
@@ -660,9 +662,25 @@ class PaneActions:
 
 
 def _follow_session(session, telemetry):
+    unmute = None
+
+    def mic_back():
+        if telemetry.agent.get("mic", True):  # the owner's dashboard mute wins
+            session.input.set_audio_enabled(True)
+
     def agent_state(ev):
+        nonlocal unmute
         telemetry.agent["state"] = ev.new_state
         telemetry.touch()
+        if ECHO_GUARD:
+            # The Mac's speaker reaches its mic: without this the model hears itself and acts on it.
+            if unmute:
+                unmute.cancel()
+                unmute = None
+            if ev.new_state == "speaking":
+                session.input.set_audio_enabled(False)
+            elif ev.old_state == "speaking":
+                unmute = asyncio.get_running_loop().call_later(ECHO_TAIL_S, mic_back)
 
     def user_state(ev):
         telemetry.agent["user_state"] = ev.new_state

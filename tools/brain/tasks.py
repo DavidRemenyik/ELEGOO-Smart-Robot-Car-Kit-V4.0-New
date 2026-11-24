@@ -178,22 +178,31 @@ def follow_person(r: SafeDrive, vision: Vision, target_cm: int) -> str:
         seen_at = now
         expected = target.bearing + pan - 90
         tick += 1
+        # Every range request costs a link round trip, so sample every second decision; the real car makes
+        # about 5 a second, so keep 1.5 s of readings.
         if tick % 2 == 1 and abs(target.bearing) <= 12:
             ranges.append(r.distance())
             range_at = time.monotonic()
-        if now - range_at > 0.65:
+        if now - range_at > 1.5:
             ranges.clear()
-        sonar = median(ranges) if len(ranges) >= 3 else None
+        sonar = median(ranges) if len(ranges) >= 2 else None
         # 38 cm apparent width at 52/60° HFOV; a rough cue, not an absolute safety sensor.
         size_cm = (33 if not vision.fake else 29) / max(0.02, target.width)
         agrees = sonar is not None and sonar < 150 and abs(sonar - size_cm) < max(28, 0.5 * size_cm)
+        # The low, level range sensor often sees past a person's legs: then nothing is nearer than the
+        # person and the camera's size estimate leads, more slowly.
+        clear_past = sonar is None or sonar > size_cm - 28
         desired = 0.0
-        if agrees and not target.clipped and abs(expected) < 14 and abs(pan - 90) <= 14:
-            error = min(sonar, 0.80 * sonar + 0.20 * size_cm) - target_cm
-            desired = clamp(52 + 0.85 * error, 0, 102) if error > 9 else clamp(6 * error, 0, 58)
+        if (agrees or clear_past) and not target.clipped and abs(expected) < 14 and abs(pan - 90) <= 14:
+            gap = min(sonar, 0.80 * sonar + 0.20 * size_cm) if agrees else size_cm
+            error = gap - target_cm
+            desired = clamp(52 + 0.85 * error, 0, 102 if agrees else 70) if error > 9 else clamp(6 * error, 0, 58)
         speed += clamp(desired - speed, -29, 17)
-        if sonar is None or sonar < 35 or (ranges and ranges[-1] < 25) or abs(expected) > 19:
+        if (sonar is not None and sonar < 35) or (ranges and ranges[-1] < 25) or abs(expected) > 19:
             speed = 0
+        if tick % 5 == 0:
+            log.info("follow: bearing %.0f width %.2f clipped %s size %.0f cm sonar %s agrees %s pan %d speed %.0f",
+                     expected, target.width, target.clipped, size_cm, sonar, agrees, pan, speed)
         steer = math.copysign(clamp(39 + 1.45 * abs(expected), 0, 85), expected) if abs(expected) > 4 else 0
         if ranges and ranges[-1] < 25:
             steer = 0
@@ -489,10 +498,8 @@ def go_to(r: SafeDrive, vision: Vision, trip: navigation.Trip, where: navigation
             if len(r.stall.events) > seen:
                 seen = len(r.stall.events)
                 stalls += 1
-                if nav.state == "driving":
-                    # The sensors miss what the car pushes against: start the navigator's own stuck recovery
-                    # (back up, turn, block the spot ahead, replan) now instead of after 8 s without progress.
-                    nav._start_recovery()
+                # The sensors miss what the car pushes against: recover now instead of after 8 s without progress.
+                nav.blocked_ahead()
             due += navigation.DT
             if (pause := due - time.monotonic()) > 0:
                 r.wait(pause)
