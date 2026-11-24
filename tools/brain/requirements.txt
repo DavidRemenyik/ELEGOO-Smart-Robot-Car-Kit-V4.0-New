@@ -2,3 +2,5 @@ pyserial
 esptool
 livekit-agents[google,elevenlabs,silero]~=1.8
 pillow
+onnxruntime>=1.20,<2
+numpy>=1.26,<3

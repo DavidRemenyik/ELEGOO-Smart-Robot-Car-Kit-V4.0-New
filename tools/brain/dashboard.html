@@ -271,6 +271,7 @@ svg text { font-family: var(--font); }
   </div>
   <span class="spacer"></span>
   <button class="toggle" id="t-auto" role="switch" aria-checked="true" title="Let the agent drive the wheels"><span class="sw"></span><span>Agent drives<span class="lbl-long"> itself</span></span></button>
+  <button class="toggle" id="t-initiative" role="switch" aria-checked="false" title="Allow greetings and scheduled patrols without a request"><span class="sw"></span><span>Initiative</span></button>
   <button class="toggle" id="t-mic" role="switch" aria-checked="true" title="Mute or unmute the Mac microphone (M)"><span class="sw"></span><span id="t-mic-lbl">Mic on</span><kbd class="lbl-long">M</kbd></button>
   <button class="estop" id="estop" title="Stop the car and the agent (Space)"><svg width="16" height="16"><use href="#i-octagon"/></svg>STOP <kbd>Space</kbd></button>
 </header>
@@ -502,6 +503,7 @@ document.querySelectorAll(".key").forEach((b) => {
 });
 $("estop").addEventListener("click", estop);
 $("t-auto").addEventListener("click", () => send({ t: "autonomy", on: $("t-auto").getAttribute("aria-checked") !== "true" }));
+$("t-initiative").addEventListener("click", () => send({ t: "initiative", on: $("t-initiative").getAttribute("aria-checked") !== "true" }));
 function toggleMic() { send({ t: "mic", on: $("t-mic").getAttribute("aria-checked") !== "true" }); }
 $("t-mic").addEventListener("click", toggleMic);
 $("speed").addEventListener("input", (e) => { $("speed-v").textContent = e.target.value; send({ t: "speed", value: +e.target.value }); });
@@ -728,6 +730,7 @@ function render(state) {
   $("agent-dot").className = "dot " + (st === "speaking" ? "agent pulse" : st === "thinking" ? "warn pulse" : st === "listening" ? "ok" : "");
   $("agent-sub").textContent = state.agent.user_state === "speaking" ? "you are speaking" : "";
   $("t-auto").setAttribute("aria-checked", state.agent.autonomy);
+  $("t-initiative").setAttribute("aria-checked", state.agent.initiative);
   $("t-mic").setAttribute("aria-checked", state.agent.mic);
   $("t-mic-lbl").textContent = state.agent.mic ? "Mic on" : "Mic muted";
 

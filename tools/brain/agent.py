@@ -16,6 +16,10 @@ The ElevenLabs key comes from ELEVENLABS_API_KEY / ELEVEN_API_KEY, else from Sec
 (gcloud secrets versions access latest --secret=ELEVENLABS_API_KEY); it is kept in memory only.
 Other settings: GEMINI_MODEL, GEMINI_LOCATION, ELEVEN_VOICE_ID, ELEVEN_MODEL.
 
+Following a person and patrol sightings need the person detector (3.7 MB, once per venv):
+  mkdir -p .venv/share/elegoo && curl -fsSL -o .venv/share/elegoo/yolox_nano.onnx \
+    https://github.com/Megvii-BaseDetection/YOLOX/releases/download/0.1.1rc0/yolox_nano.onnx
+
 drive.py steers each move from the Mac with the gyro and range sensor. The firmware stops the
 wheels when commands stop arriving, and forward moves stop when the ultrasonic sensor sees
 something closer than STOP_CM.
@@ -40,6 +44,8 @@ import behaviors
 from drive import Driver
 from dashboard import Dashboard, Pilot, Recorder, Telemetry
 from robot import DEFAULT_HOST, Robot
+from tasks import ObjectModel, TaskManager, find_object, follow_person, patrol
+from vision import Vision
 
 HOST = os.environ.get("CAR_HOST", DEFAULT_HOST)
 PORT = int(os.environ.get("CAR_PORT", "100"))
@@ -61,6 +67,7 @@ REPEAT_S = 3.0  # Gemini Live sometimes re-issues the move it just made; an iden
 MANUAL_SPEED = 150
 HUMAN_HOLD_S = 1.5  # after the human touches the controls, the agent keeps its wheels still this long
 RECONNECT_S = 3.0
+INITIATIVE = os.environ.get("CAR_INITIATIVE", "0") == "1"
 
 log = logging.getLogger("car-agent")
 
@@ -76,26 +83,19 @@ person you talk with sits near the Mac and may be in a different spot, or a diff
 what your camera shows. Hearing someone clearly does not mean they are close to you.
 
 How you move:
-- Only move while you are doing a task someone gave you (find a person, find an object, come here,
-  look around, patrol). With no task, stay still and just talk.
+- Only move on a request. An independent, owner-enabled schedule handles self-started actions;
+  never start one yourself through a tool. Do not offer navigation to named places.
 - drive_forward runs smoothly, holds its heading and slows down by itself before obstacles, so
   prefer one long move (up to 300 cm) over many short ones. turn reports the angle really turned.
   After each move, look at the new camera view before deciding the next move.
-- explore drives around on its own for a while; use it to patrol or to cover ground while
-  searching. It keeps running after the tool returns: watch the camera, and call stop to end it.
-  Any other move or look also ends it. You are told when it ends.
+- Use follow_person, patrol, or find_object directly for those jobs, not chains of moves, looks
+  or explore. They run in the background and speak their own factual results. Confirm the start
+  briefly, then let them work. Use task_status to check without interrupting. A new motion tool
+  replaces the current job, so don't call moves or looks merely to check its progress.
+- explore is for unstructured roaming, not patrol or search.
 - look_direction pans only your head and camera, which is quicker than turning the whole car.
 - If a move reports it was blocked, do not repeat it; turn and find another way.
 - When someone says stop, call stop immediately.
-
-Finding things:
-- To search, look left and right with look_direction, then turn about 60 degrees at a time and check
-  the view after each step. A full circle is about 6 steps. Say briefly what you see as you go.
-- When you spot the target, turn so it is in the middle of the view and drive toward it in short
-  steps, stopping about 30 to 50 cm away.
-- When you find a person, greet them warmly, introduce yourself, and chat. When you find an object,
-  say where it is.
-- If you cannot find it after a full circle and a couple of moves, say so and ask for a hint.
 
 Never claim to see something you are not seeing. If the camera view is dark or blurry, say so.
 """
@@ -183,20 +183,14 @@ class Car:
         self._lock = threading.Lock()
         self._retry_at = 0.0
         self._human_at = 0.0
-        self.cancel = threading.Event()
+        self.human_epoch = 0
 
     def human_input(self):
         self._human_at = time.monotonic()
+        self.human_epoch += 1
 
     def human_active(self):
         return time.monotonic() - self._human_at < HUMAN_HOLD_S
-
-    def should_stop(self):
-        if self.cancel.is_set():
-            return "I was told to stop"
-        if self.human_active():
-            return "the human took over the controls"
-        return None
 
     def _call(self, fn, by):
         try:
@@ -207,6 +201,8 @@ class Car:
             self._drop()
             self._retry_at = time.monotonic() + RECONNECT_S
             self.telemetry.link.update(state="offline", error=str(e))
+            self.telemetry.sensors["on_ground"] = None
+            self.telemetry.moved(None, None)
             self.telemetry.touch()
             raise
 
@@ -250,26 +246,26 @@ class Car:
             self._drop()
 
 
-def _forward(robot, cm, should_stop):
-    gone, why = Driver(robot, should_stop).forward(cm, STOP_CM)
+def _forward(robot, cm):
+    gone, why = Driver(robot).forward(cm, STOP_CM)
     if why:
         return f"Stopped after about {gone:.0f} cm: {why}."
     return f"Drove forward about {gone:.0f} cm. Clear distance ahead is {robot.distance()} cm."
 
 
-def _back(robot, cm, should_stop):
-    gone, why = Driver(robot, should_stop).back(cm)
+def _back(robot, cm):
+    gone, why = Driver(robot).back(cm)
     return f"Backed up about {gone:.0f} cm" + (f", then stopped: {why}." if why else ".")
 
 
-def _turn(robot, degrees, should_stop):
-    turned, why = Driver(robot, should_stop).turn(degrees)
+def _turn(robot, degrees):
+    turned, why = Driver(robot).turn(degrees)
     side = "left" if turned > 0 else "right"
     return f"Turned {abs(turned):.0f} degrees {side}" + (f", then stopped: {why}." if why else ".")
 
 
-def _explore(robot, seconds, should_stop):
-    driven, turns, why = Driver(robot, should_stop).explore(seconds, STOP_CM)
+def _explore(robot, seconds):
+    driven, turns, why = Driver(robot).explore(seconds, STOP_CM)
     return f"Explored: drove about {driven:.0f} cm and changed direction {turns} times. " + (f"Ended early: {why}." if why else "Time is up.")
 
 
@@ -279,7 +275,12 @@ def _look(robot, degrees):
 
 
 def _scan(robot):
-    readings = behaviors.scan(robot)
+    readings = []
+    for angle in range(10, 171, 20):
+        robot.head(angle)
+        robot.wait(0.3)
+        readings.append((angle, robot.distance()))
+    robot.head(behaviors.CENTER)
     parts = [f"{angle - behaviors.CENTER:+d} deg: {cm} cm" for angle, cm in readings]
     return "Free distance by head angle (+ is left): " + ", ".join(parts)
 
@@ -291,7 +292,17 @@ class CarAgent(Agent):
         self.camera = camera
         self.telemetry = car.telemetry
         self._last_move = None
-        self._exploring = None
+        self.jobs = TaskManager(car, Vision(camera._url), self._speak_task)
+        self.object_model = ObjectModel(PROJECT, LOCATION, MODEL)
+
+    async def _speak_task(self, text: str) -> bool:
+        speech = self.session.say(text, allow_interruptions=True)
+        try:
+            await speech.wait_for_playout()
+        except asyncio.CancelledError:
+            speech.interrupt()
+            raise
+        return not speech.interrupted
 
     async def llm_node(self, chat_ctx, tools, model_settings):
         # Every model call, including the one right after a move, sees the camera as it is now.
@@ -306,19 +317,6 @@ class CarAgent(Agent):
         async for chunk in Agent.default.llm_node(self, chat_ctx, tools, model_settings):
             yield chunk
 
-    async def _end_exploring(self):
-        if self._exploring and not self._exploring.done():
-            self.car.cancel.set()
-            await self._exploring
-
-    async def _explore(self, seconds):
-        try:
-            result = await self._act(f"Explore {seconds} s", lambda r: _explore(r, seconds, self.car.should_stop), settle=False)
-        except ToolError as e:
-            result = str(e)
-        if not self.car.cancel.is_set():
-            self.session.generate_reply(instructions=f"Your exploring ended. {result} Tell the person briefly what you saw on the way.")
-
     async def _drive(self, label, move, fn):
         if not self.telemetry.agent["autonomy"]:
             return self._refuse(label, "Not moved: the human has paused my driving from the control pane.")
@@ -327,31 +325,14 @@ class CarAgent(Agent):
         last, self._last_move = self._last_move, None
         if last and last[0] == move and time.monotonic() - last[1] < REPEAT_S:
             return self._refuse(label, "Skipped: that exact move just finished. Look at the camera view; if you still want it, call it again.")
-        await self._end_exploring()
-        self.car.cancel.clear()
-        if fn is None:
-            self._exploring = asyncio.create_task(self._explore(move[1]))
-            self._last_move = (move, time.monotonic())
-            return "Exploring on my own now. Watch the camera; call stop to end it early."
-        result = await self._act(label, fn)
+        result = await self.jobs.dispatch(label, fn, background=False)
+        await asyncio.sleep(SETTLE_S)
         self._last_move = (move, time.monotonic())
         return result
 
     def _refuse(self, label, reason):
         self.telemetry.tool_end(self.telemetry.tool_start(label), reason, ok=False)
         return reason
-
-    async def _act(self, label, fn, settle=True):
-        entry = self.telemetry.tool_start(label)
-        try:
-            result = await asyncio.to_thread(self.car.run, fn)
-        except ToolError as e:
-            self.telemetry.tool_end(entry, str(e), ok=False)
-            raise
-        self.telemetry.tool_end(entry, result)
-        if settle:
-            await asyncio.sleep(SETTLE_S)
-        return result
 
     @function_tool()
     async def drive_forward(self, centimeters: int) -> str:
@@ -361,7 +342,7 @@ class CarAgent(Agent):
             centimeters: distance to drive, 5 to 300.
         """
         cm = max(5, min(300, centimeters))
-        return await self._drive(f"Drive forward {cm} cm", ("forward", cm), lambda r: _forward(r, cm, self.car.should_stop))
+        return await self._drive(f"Drive forward {cm} cm", ("forward", cm), lambda r: _forward(r, cm))
 
     @function_tool()
     async def drive_back(self, centimeters: int) -> str:
@@ -371,7 +352,7 @@ class CarAgent(Agent):
             centimeters: distance to back up, 5 to 40.
         """
         cm = max(5, min(40, centimeters))
-        return await self._drive(f"Back up {cm} cm", ("back", cm), lambda r: _back(r, cm, self.car.should_stop))
+        return await self._drive(f"Back up {cm} cm", ("back", cm), lambda r: _back(r, cm))
 
     @function_tool()
     async def turn(self, direction: Literal["left", "right"], degrees: int) -> str:
@@ -382,11 +363,11 @@ class CarAgent(Agent):
             degrees: how far to spin, 5 to 180.
         """
         deg = max(5, min(180, abs(degrees))) * (1 if direction == "left" else -1)
-        return await self._drive(f"Turn {direction} {abs(deg)}°", ("turn", deg), lambda r: _turn(r, deg, self.car.should_stop))
+        return await self._drive(f"Turn {direction} {abs(deg)}°", ("turn", deg), lambda r: _turn(r, deg))
 
     @function_tool()
     async def explore(self, seconds: int) -> str:
-        """Drive around on your own, avoiding obstacles, to patrol or to cover ground while searching.
+        """Roam without a specific goal, avoiding obstacles.
 
         Returns at once while the car keeps driving. You are told when it ends.
 
@@ -394,7 +375,7 @@ class CarAgent(Agent):
             seconds: how long to explore, 10 to 120.
         """
         secs = max(10, min(120, seconds))
-        return await self._drive(f"Explore {secs} s", ("explore", secs), None)
+        return await self.jobs.dispatch(f"exploring for {secs} seconds", lambda r: _explore(r, secs))
 
     @function_tool()
     async def look_direction(self, direction: Literal["left", "right", "forward"], degrees: int = 45) -> str:
@@ -406,35 +387,84 @@ class CarAgent(Agent):
         """
         deg = 0 if direction == "forward" else max(10, min(80, abs(degrees))) * (1 if direction == "left" else -1)
         label = "Look forward" if deg == 0 else f"Look {direction} {abs(deg)}°"
-        await self._end_exploring()
-        return await self._act(label, lambda r: _look(r, deg))
+        result = await self.jobs.dispatch(label, lambda r: _look(r, deg), background=False)
+        await asyncio.sleep(SETTLE_S)
+        return result
 
     @function_tool()
     async def scan_distances(self) -> str:
         """Sweep the head left to right and measure free space in each direction, in cm."""
-        await self._end_exploring()
-        return await self._act("Scan distances", _scan, settle=False)
+        return await self.jobs.dispatch("Scan distances", _scan, background=False)
+
+    @function_tool()
+    async def follow_person(self, distance_cm: int = 85) -> str:
+        """Follow a visible person, keeping roughly distance_cm away, and report if lost.
+
+        Args:
+            distance_cm: desired separation, 65 to 120 cm.
+        """
+        cm = max(65, min(120, distance_cm))
+        return await self.jobs.dispatch("following a person", lambda r: follow_person(r, self.jobs.vision, cm))
+
+    @function_tool()
+    async def patrol(self, seconds: int = 30) -> str:
+        """Roam, save pictures, and report when done.
+
+        Args:
+            seconds: desired duration, 10 to 120 seconds.
+        """
+        secs = max(10, min(120, seconds))
+        return await self.jobs.dispatch(f"a {secs} second patrol", lambda r: patrol(r, self.jobs.vision, secs))
+
+    @function_tool()
+    async def find_object(self, name: str) -> str:
+        """Search for a named visible object, then approach safely and report.
+
+        Args:
+            name: concise visual name of a physical object, not a named place.
+        """
+        name = " ".join(name.split())[:100]
+        if not name:
+            return "Tell me what object to look for."
+        loop = asyncio.get_running_loop()
+        return await self.jobs.dispatch(
+            f"searching for {name}",
+            lambda r: find_object(r, self.jobs.vision, lambda jpeg: self.object_model.locate(name, jpeg), name, loop),
+        )
+
+    @function_tool()
+    async def task_status(self) -> str:
+        """Check the current or most recent task without ending it."""
+        return self.jobs.status()
 
     @function_tool()
     async def stop(self) -> str:
         """Stop all motion immediately."""
-        self.car.cancel.set()
-        await self._end_exploring()
-        await self._act("Stop", lambda r: r.stop(), settle=False)
-        return "Stopped."
+        self._last_move = None
+        return await self.jobs.stop("I was told to stop")
 
 
 server = AgentServer()
 
 
 class PaneActions:
-    def __init__(self, session, telemetry):
+    def __init__(self, session, telemetry, jobs):
         self.session = session
         self.telemetry = telemetry
+        self.jobs = jobs
 
     async def estop(self):
-        self.telemetry.agent["autonomy"] = False
         await self.session.interrupt(force=True)
+
+    def set_autonomy(self, on):
+        self.telemetry.agent["autonomy"] = on
+        if not on:
+            self.jobs.cancel("the human paused autonomy")
+
+    def set_initiative(self, on):
+        self.telemetry.agent["initiative"] = on
+        if not on:
+            self.jobs.cancel("initiative was switched off", initiative_only=True)
 
     def set_mic(self, on):
         self.session.input.set_audio_enabled(on)
@@ -472,8 +502,8 @@ def _follow_session(session, telemetry):
 @server.rtc_session()
 async def entrypoint(ctx: agents.JobContext):
     telemetry = Telemetry(STOP_CM)
+    telemetry.agent["initiative"] = INITIATIVE
     car = Car(HOST, PORT, telemetry)
-    ctx.add_shutdown_callback(lambda: asyncio.to_thread(car.close))
     camera = CarCamera(CAMERA_URL, telemetry)
     session = AgentSession(
         stt=google.STT(languages="en-US", model="latest_long"),
@@ -482,12 +512,21 @@ async def entrypoint(ctx: agents.JobContext):
         vad=silero.VAD.load(),
     )
     _follow_session(session, telemetry)
-    await session.start(room=ctx.room, agent=CarAgent(car, camera))
+    agent = CarAgent(car, camera)
+    await session.start(room=ctx.room, agent=agent)
     camera.start()
-    ctx.add_shutdown_callback(camera.close)
-    pane = Dashboard(telemetry, Pilot(car, telemetry, MANUAL_SPEED, behaviors.scan), PaneActions(session, telemetry), STREAM_URL, DASHBOARD_PORT)
+    agent.jobs.start()
+    pane = Dashboard(telemetry, Pilot(car, telemetry, MANUAL_SPEED, behaviors.scan),
+                     PaneActions(session, telemetry, agent.jobs), STREAM_URL, DASHBOARD_PORT)
     await pane.start()
-    ctx.add_shutdown_callback(pane.close)
+
+    async def shutdown():
+        await pane.close()
+        await agent.jobs.close()
+        camera.close()
+        await asyncio.to_thread(car.close)
+
+    ctx.add_shutdown_callback(shutdown)
     await session.generate_reply(instructions="Say a short hello and that you can look around, find people, and find things.")
 
 

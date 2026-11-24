@@ -55,7 +55,7 @@ class Telemetry:
         self.sonar = collections.deque(maxlen=120)
         self.motion = {"by": None, "dir": None}
         self.frame = {"id": 0, "t": None, "jpeg": None}
-        self.agent = {"state": "initializing", "user_state": "listening", "autonomy": True, "mic": True}
+        self.agent = {"state": "initializing", "user_state": "listening", "autonomy": True, "initiative": False, "mic": True}
         self.transcript = collections.deque(maxlen=40)
         self.tools = collections.deque(maxlen=24)
         self.notices = collections.deque(maxlen=10)
@@ -180,7 +180,9 @@ class Recorder:
             direction = "left" if right > left else "right"
         if direction != self._t.motion["dir"]:
             self._t.moved(self._by if direction else None, direction)
-        return self._timed(self._robot.wheels, left, right)
+        status = self._timed(self._robot.wheels, left, right)
+        self._t.sensors["on_ground"] = status[1]
+        return status
 
     def stop(self):
         self._timed(self._robot.stop)
@@ -278,7 +280,14 @@ class Pilot:
                         await self._car(lambda r: r.stop())
                         self._driving = None
                     return
-            await self._car(lambda r: r.drive(want, self.speed))
+            def move(r):
+                if self.drive_dir == want and time.monotonic() - self.drive_seen <= WATCHDOG_S:
+                    r.drive(want, self.speed)
+                    return True
+                return False
+
+            if not await self._car(move):
+                return
             self._driving = want
             self._last_safety = now
         elif self._driving == "forward" and now - self._last_safety > SAFETY_S:
@@ -401,13 +410,17 @@ class Dashboard:
         elif kind == "scan":
             asyncio.create_task(self.pilot.scan())
         elif kind == "estop":
+            self.actions.set_autonomy(False)
             await self.pilot.estop()
             await self.actions.estop()
         elif kind == "speed":
             self.pilot.speed = max(60, min(255, int(cmd.get("value", self.pilot.speed))))
         elif kind == "autonomy":
-            self.t.agent["autonomy"] = bool(cmd.get("on"))
+            self.actions.set_autonomy(bool(cmd.get("on")))
             self.t.notice("Agent driving enabled" if self.t.agent["autonomy"] else "Agent driving paused")
+        elif kind == "initiative":
+            self.actions.set_initiative(bool(cmd.get("on")))
+            self.t.notice("Initiative enabled" if self.t.agent["initiative"] else "Initiative off")
         elif kind == "mic":
             self.actions.set_mic(bool(cmd.get("on")))
         elif kind == "say" and cmd.get("text", "").strip():
