@@ -89,6 +89,17 @@ static esp_err_t captureHandler(httpd_req_t *req) {
   return res;
 }
 
+// Uptime, last reset reason, Wi-Fi signal and free heap: tells a reboot from a Wi-Fi drop.
+static esp_err_t statusHandler(httpd_req_t *req) {
+  char body[160];
+  snprintf(body, sizeof body,
+           "{\"uptime_s\":%lu,\"reset_reason\":%d,\"rssi\":%d,\"free_heap\":%u,\"free_psram\":%u}",
+           (unsigned long)(millis() / 1000), (int)esp_reset_reason(), (int)WiFi.RSSI(),
+           (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram());
+  httpd_resp_set_type(req, "application/json");
+  return httpd_resp_send(req, body, HTTPD_RESP_USE_STRLEN);
+}
+
 static esp_err_t streamHandler(httpd_req_t *req) {
   httpd_resp_set_type(req, "multipart/x-mixed-replace;boundary=frame");
   httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
@@ -121,6 +132,7 @@ static void startHttp() {
   if (httpd_start(&web, &cfg) == ESP_OK) {
     registerUri(web, "/", indexHandler);
     registerUri(web, "/capture", captureHandler);
+    registerUri(web, "/status", statusHandler);
   }
   cfg.server_port = 81;
   cfg.ctrl_port += 1;
