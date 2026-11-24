@@ -13,6 +13,7 @@ HEARTBEAT = b"{Heartbeat}"
 # N=2/N=3 direction codes: code 1 spins the car to its left (checked on the real car 2026-11-24).
 DIRECTIONS = {"left": 1, "right": 2, "forward": 3, "back": 4}
 MAX_RANGE_CM = 150
+RANGE_HOLD_CM, RANGE_HOLD_S = 35, 1.0  # see Robot.distance
 
 
 class WifiLink:
@@ -86,6 +87,7 @@ class Robot:
         self._drift = self._corr = 0.0  # deg/s now; degrees removed so far
         self._corr_t = time.monotonic()
         self._moved_at, self._held, self._rest = 0.0, False, None
+        self._head, self._close = 90, None  # last head angle sent; last close range (time, cm, head)
 
     @classmethod
     def usb(cls, port=DEFAULT_PORT, baud=9600, boot_wait=2.5):
@@ -175,11 +177,23 @@ class Robot:
         return self._status(self._request({"N": 24}))
 
     def head(self, angle):
-        self._request({"N": 5, "D1": 1, "D2": max(0, min(180, int(angle)))})
+        self._head = max(0, min(180, int(angle)))
+        self._request({"N": 5, "D1": 1, "D2": self._head})
 
     def distance(self):
-        cm = int(self._request({"N": 21, "D1": 2}))
-        return MAX_RANGE_CM if cm <= 0 or cm > MAX_RANGE_CM else cm
+        """Range ahead of the head in cm, 1..MAX_RANGE_CM.
+
+        The firmware answers 0 for an echo under 1 cm (touching) and MAX_RANGE_CM when no echo returns, which
+        also happens right at a wall or at a slant (seen on the car 2026-11-24). So a MAX right after a close
+        reading at the same head angle keeps the close reading for up to RANGE_HOLD_S.
+        """
+        cm = max(1, min(MAX_RANGE_CM, int(self._request({"N": 21, "D1": 2}))))
+        now = time.monotonic()
+        held = self._close
+        if cm >= MAX_RANGE_CM and held and held[2] == self._head and now - held[0] < RANGE_HOLD_S:
+            return held[1]
+        self._close = (now, cm, self._head) if cm <= RANGE_HOLD_CM else None
+        return cm
 
     def line(self):
         return tuple(int(self._request({"N": 22, "D1": i})) for i in range(3))
