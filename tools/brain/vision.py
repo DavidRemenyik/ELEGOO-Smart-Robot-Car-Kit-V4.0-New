@@ -17,6 +17,7 @@ from PIL import Image
 MODEL = Path(sys.prefix) / "share/elegoo/yolox_nano.onnx"
 SIZE = 416
 MAX_JPEG = 2_000_000
+STREAM_RETRY_S = 5.0  # after a stream failure, read stills this long before trying the stream again
 log = logging.getLogger("car-agent")
 
 
@@ -101,8 +102,9 @@ class _NoRedirect(HTTPRedirectHandler):
 class Vision:
     """Publish only the latest frame; never queue images or read the control link."""
 
-    def __init__(self, camera_url: str):
+    def __init__(self, camera_url: str, stream_url: str | None = None):
         self.url = camera_url
+        self.stream_url = stream_url
         self.fake = (
             os.getenv("CAR_FAKE_VISION") == "1"
             and urlsplit(camera_url).hostname in ("127.0.0.1", "::1")
@@ -117,8 +119,11 @@ class Vision:
             self._thread.start()
 
     def latest(self) -> Frame | None:
+        return self.newest(0.55)
+
+    def newest(self, max_age: float) -> Frame | None:
         frame = self._frame
-        return frame if frame and time.monotonic() - frame.timestamp < 0.55 else None
+        return frame if frame and time.monotonic() - frame.timestamp < max_age else None
 
     def close(self) -> None:
         self._closed.set()
@@ -126,35 +131,60 @@ class Vision:
             self._thread.join(timeout=1.2)
 
     def _run(self) -> None:
-        if not self.fake and not MODEL.is_file():
+        installed = MODEL.is_file()
+        if not self.fake and not installed:
             log.error("Person detector not installed: %s (the download command is at the top of agent.py)", MODEL)
-            return
-        detector = None if self.fake else Detector()
+        detector = Detector() if installed and not self.fake else None
         opener = build_opener(_NoRedirect)
         failing = False
+        stream_after = 0.0
         while not self._closed.is_set():
-            started = time.monotonic()
+            # The stand-in's person fixture rides on the still's headers, so fake vision reads stills.
+            streaming = bool(self.stream_url) and not self.fake and time.monotonic() >= stream_after
             try:
-                with opener.open(self.url, timeout=1) as response:
-                    jpeg = response.read(MAX_JPEG + 1)
-                    fixture = response.headers.get("X-Fake-Person", "")
-                if not jpeg or len(jpeg) > MAX_JPEG:
-                    raise ValueError("unexpected JPEG size")
-                if detector:
-                    people = detector.detect(jpeg)
-                elif fixture:
-                    x0, y0, x1, y1 = map(float, fixture.split(","))
-                    if not (0 <= x0 < x1 <= 1 and 0 <= y0 < y1 <= 1):
-                        raise ValueError("invalid stand-in box")
-                    people = (person_box((x0, y0, x1, y1), 60),)
-                else:
-                    people = ()
-                self._frame = Frame(started, jpeg, people)
-                failing = False
+                for started, jpeg, fixture in (self._stream if streaming else self._still)(opener):
+                    if not jpeg or len(jpeg) > MAX_JPEG:
+                        raise ValueError("unexpected JPEG size")
+                    if detector:
+                        people = detector.detect(jpeg)
+                    elif fixture:
+                        x0, y0, x1, y1 = map(float, fixture.split(","))
+                        if not (0 <= x0 < x1 <= 1 and 0 <= y0 < y1 <= 1):
+                            raise ValueError("invalid stand-in box")
+                        people = (person_box((x0, y0, x1, y1), 60),)
+                    else:
+                        people = ()
+                    self._frame = Frame(started, jpeg, people)
+                    failing = False
             except (ValueError, OSError) as e:
                 self._frame = None
                 if not failing:
                     log.warning("Person camera unavailable: %s", e)
                 failing = True
+                if streaming:
+                    stream_after = time.monotonic() + STREAM_RETRY_S
                 self._closed.wait(0.5)
-            self._closed.wait(max(0, 1 / 12 - (time.monotonic() - started)))
+
+    def _still(self, opener):
+        started = time.monotonic()
+        with opener.open(self.url, timeout=3) as response:
+            jpeg = response.read(MAX_JPEG + 1)
+            fixture = response.headers.get("X-Fake-Person", "")
+        yield started, jpeg, fixture
+        self._closed.wait(max(0, 1 / 12 - (time.monotonic() - started)))
+
+    def _stream(self, opener):
+        """Yield JPEGs from the MJPEG stream: one connection, so no per-picture setup to stall on."""
+        with opener.open(self.stream_url, timeout=3) as response:
+            buffer, started = b"", time.monotonic()
+            while not self._closed.is_set():
+                chunk = response.read1(65536)
+                if not chunk:
+                    raise OSError("camera stream ended")
+                buffer += chunk
+                if len(buffer) > 2 * MAX_JPEG:
+                    raise ValueError("no JPEG in the camera stream")
+                while (start := buffer.find(b"\xff\xd8")) >= 0 and (end := buffer.find(b"\xff\xd9", start + 2)) >= 0:
+                    yield started, buffer[start:end + 2], ""
+                    # The camera grabs the next picture only after this one is sent.
+                    buffer, started = buffer[end + 2:], time.monotonic()

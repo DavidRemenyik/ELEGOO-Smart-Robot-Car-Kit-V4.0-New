@@ -8,7 +8,7 @@ Without the car:                  .venv/bin/python fake_car.py --port 18100 --ca
                                   CAR_CAMERA_URL=http://127.0.0.1:18101/capture \
                                   CAR_STREAM_URL=http://127.0.0.1:18101/stream .venv/bin/python agent.py console --text
 
-Pipeline: Google Cloud Speech-to-Text hears the mic, Gemini on Vertex AI (project from
+Pipeline: ElevenLabs speech-to-text hears the mic, Gemini on Vertex AI (project from
 GOOGLE_CLOUD_PROJECT, default agrointel-dd8f6, via gcloud application-default credentials)
 reads the words plus a fresh car camera picture on every turn and picks the moves, and
 ElevenLabs speaks the reply (CAR_VOICE=google switches to Google Cloud TTS).
@@ -27,12 +27,12 @@ something closer than STOP_CM.
 
 import asyncio
 import base64
+import functools
 import logging
 import os
 import subprocess
 import threading
 import time
-import urllib.request
 from typing import Literal
 
 from livekit import agents
@@ -59,9 +59,12 @@ CAR_VOICE = os.environ.get("CAR_VOICE", "elevenlabs")
 ELEVEN_VOICE_ID = os.environ.get("ELEVEN_VOICE_ID", "cgSgspJ2msm6clMCkdW9")  # premade "Jessica - Playful, Bright, Warm"
 ELEVEN_MODEL = os.environ.get("ELEVEN_MODEL", "eleven_flash_v2_5")  # ElevenLabs' ultra-low-latency model
 GOOGLE_VOICE = os.environ.get("GOOGLE_TTS_VOICE", "en-US-Chirp3-HD-Puck")
-CAMERA_FPS = 1.0  # refresh rate of the control pane's still frame
+CAMERA_FPS = 5.0  # refresh rate of the control pane's still frame
+SNAPSHOT_MAX_AGE_S = 3.0  # the model never gets a picture older than this; the real camera needs up to 2 s per picture
+SNAPSHOT_WAIT_S = 6.0  # how long a model turn waits for the camera before going on blind
 
 STOP_CM = 25
+ENDPOINT_MIN_S = 0.9  # silence before a turn counts as finished; shorter cut the speaker off mid-sentence
 SETTLE_S = 0.4  # let the car and the head come to rest before the model's next picture
 MANUAL_SPEED = 150
 HUMAN_HOLD_S = 1.5  # after the human touches the controls, the agent keeps its wheels still this long
@@ -100,11 +103,7 @@ Never claim to see something you are not seeing. If the camera view is dark or b
 """
 
 
-def _fetch(url, timeout=3.0):
-    with urllib.request.urlopen(url, timeout=timeout) as r:
-        return r.read()
-
-
+@functools.cache
 def _eleven_key():
     key = os.environ.get("ELEVENLABS_API_KEY") or os.environ.get("ELEVEN_API_KEY")
     if key:
@@ -138,27 +137,38 @@ def make_llm():
 
 
 class CarCamera:
-    """Fetches a fresh camera still for every model turn and keeps the control pane's frame current."""
+    """Hands the newest camera still to the model and the control pane.
 
-    def __init__(self, url, telemetry):
-        self._url = url
+    The car's camera serves one request at a time, so Vision is its only reader and everything else
+    takes frames from it.
+    """
+
+    def __init__(self, url, stream_url, telemetry):
+        self.vision = Vision(url, stream_url)
         self._telemetry = telemetry
         self._failing = False
         self._task = None
+        self._moved_at = 0.0
+
+    def moved(self):
+        """The view just changed: only pictures requested from now on may be shown to the model."""
+        self._moved_at = time.monotonic()
 
     async def snapshot(self):
-        try:
-            jpeg = await asyncio.to_thread(_fetch, self._url)
-        except OSError as e:
-            if not self._failing:
-                log.warning("camera %s unreachable: %s", self._url, e)
-            self._failing = True
-            return None
+        self.vision.start()
+        deadline = time.monotonic() + SNAPSHOT_WAIT_S
+        while not ((frame := self.vision.newest(SNAPSHOT_MAX_AGE_S)) and frame.timestamp >= self._moved_at):
+            if time.monotonic() > deadline:
+                if not self._failing:
+                    log.warning("no camera frame for %.0f s", SNAPSHOT_WAIT_S)
+                self._failing = True
+                return None
+            await asyncio.sleep(0.05)
         if self._failing:
             log.info("camera back")
             self._failing = False
-        self._telemetry.set_frame(jpeg)
-        return jpeg
+        self._telemetry.set_frame(frame.jpeg)
+        return frame.jpeg
 
     def start(self):
         self._task = asyncio.create_task(self._refresh())
@@ -290,7 +300,7 @@ class CarAgent(Agent):
         self.car = car
         self.camera = camera
         self.telemetry = car.telemetry
-        self.jobs = TaskManager(car, Vision(camera._url), self._speak_task)
+        self.jobs = TaskManager(car, camera.vision, self._speak_task)
         self.object_model = ObjectModel(PROJECT, LOCATION, MODEL)
 
     async def _speak_task(self, text: str) -> bool:
@@ -322,6 +332,7 @@ class CarAgent(Agent):
             return self._refuse(label, "Not moved: the human is driving me right now. Wait and watch the camera.")
         result = await self.jobs.dispatch(label, fn, background=False)
         await asyncio.sleep(SETTLE_S)
+        self.camera.moved()
         return result
 
     def _refuse(self, label, reason):
@@ -383,6 +394,7 @@ class CarAgent(Agent):
         label = "Look forward" if deg == 0 else f"Look {direction} {abs(deg)}°"
         result = await self.jobs.dispatch(label, lambda r: _look(r, deg), background=False)
         await asyncio.sleep(SETTLE_S)
+        self.camera.moved()
         return result
 
     @function_tool()
@@ -497,9 +509,10 @@ async def entrypoint(ctx: agents.JobContext):
     telemetry = Telemetry(STOP_CM)
     telemetry.agent["initiative"] = INITIATIVE
     car = Car(HOST, PORT, telemetry)
-    camera = CarCamera(CAMERA_URL, telemetry)
+    camera = CarCamera(CAMERA_URL, STREAM_URL, telemetry)
     session = AgentSession(
-        stt=google.STT(languages="en-US", model="latest_long"),
+        stt=elevenlabs.STT(api_key=_eleven_key(), language_code="en", use_realtime=True),
+        min_endpointing_delay=ENDPOINT_MIN_S,
         llm=make_llm(),
         tts=make_tts(),
         vad=silero.VAD.load(),
@@ -510,7 +523,7 @@ async def entrypoint(ctx: agents.JobContext):
     camera.start()
     agent.jobs.start()
     pane = Dashboard(telemetry, Pilot(car, telemetry, MANUAL_SPEED, behaviors.scan),
-                     PaneActions(session, telemetry, agent.jobs), STREAM_URL, DASHBOARD_PORT)
+                     PaneActions(session, telemetry, agent.jobs), None, DASHBOARD_PORT)
     await pane.start()
 
     async def shutdown():

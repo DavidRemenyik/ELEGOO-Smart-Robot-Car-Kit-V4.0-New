@@ -392,7 +392,7 @@ const rad = (d) => (d * Math.PI) / 180;
 let G = null;            // geometry from the server
 let S = null;            // latest state
 let ws = null;
-let camSource = "live";
+let camSource = "agent";  // the car's camera serves one reader at a time; the direct stream starves the agent
 let streamUrl = null;
 let streamFailed = false;
 let lastFrameId = 0;
@@ -419,6 +419,7 @@ const send = (obj) => { if (ws && ws.readyState === 1) ws.send(JSON.stringify(ob
 function onHello(msg) {
   G = msg.geometry;
   streamUrl = msg.stream_url;
+  $("src-live").parentElement.hidden = !streamUrl;  // the agent keeps the car's one stream for itself
   $("speed").value = msg.speed; $("speed-v").textContent = msg.speed;
   drawRadarStatic();
   drawProfile();
