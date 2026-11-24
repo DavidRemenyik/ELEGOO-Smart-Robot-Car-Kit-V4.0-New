@@ -53,10 +53,11 @@ from livekit.plugins import elevenlabs, google, silero
 from PIL import Image
 
 import behaviors
+import navigation
 from drive import Driver
 from dashboard import Dashboard, Pilot, Recorder, Telemetry
 from robot import DEFAULT_HOST, Robot
-from tasks import ObjectModel, TaskManager, find_object, follow_person, patrol
+from tasks import ObjectModel, TaskManager, find_object, follow_person, go_to, patrol, set_home
 from vision import Vision
 
 HOST = os.environ.get("CAR_HOST", DEFAULT_HOST)
@@ -102,11 +103,17 @@ what your camera shows. Hearing someone clearly does not mean they are close to 
 
 How you move:
 - Only move on a request. An independent, owner-enabled schedule handles self-started actions;
-  never start one yourself through a tool. Do not offer navigation to named places.
+  never start one yourself through a tool.
+- go_to drives you by yourself to a named place in the house (a room such as the kitchen, or home). It
+  assumes you start at home, or where your last trip ended, unless the person tells you which room you
+  are in: then pass start_room. Its arrival is a best guess, so say "I think I'm in the kitchen", never
+  that you are certainly there. where_am_i gives your current best guess and how sure you are: use it
+  for "where are you?", also during a trip, and never call go_to again for that. When the owner says the
+  spot you are on is home, call set_home.
 - drive_forward runs smoothly, holds its heading and slows down by itself before obstacles, so
   prefer one long move (up to 300 cm) over many short ones. turn reports the angle really turned.
   After each move, look at the new camera view before deciding the next move.
-- Use follow_person, patrol, or find_object directly for those jobs, not chains of moves, looks
+- Use follow_person, patrol, find_object, or go_to directly for those jobs, not chains of moves, looks
   or explore. They run in the background and speak their own factual results. Confirm the start
   briefly, then let them work. Use task_status to check without interrupting. A new motion tool
   replaces the current job, so don't call moves or looks merely to check its progress.
@@ -553,6 +560,60 @@ class CarAgent(Agent):
         return await self.jobs.dispatch(
             f"searching for {name}",
             lambda r: find_object(r, self.jobs.vision, lambda jpeg: self.object_model.locate(name, jpeg), name, loop),
+        )
+
+    @function_tool()
+    async def go_to(self, place: str, start_room: str = "") -> str:
+        """Drive by yourself to a named place in the house, such as the kitchen, or home.
+
+        Returns at once while the car drives. You are told when it ends.
+
+        Args:
+            place: the place the person named, for example "kitchen" or "home".
+            start_room: the room you are in now, only if the person said so or you were carried or driven by
+                hand since your last trip. Leave empty to start from home, or from where your last trip ended.
+        """
+        try:
+            trip = await asyncio.to_thread(navigation.plan_trip, place, start_room or None, self.jobs.where)
+        except ValueError as e:  # UnknownPlace lists the known places; others: the map cannot reach the goal
+            return str(e) if isinstance(e, navigation.UnknownPlace) else f"I can't go there: {e}."
+        if (job := self.jobs.active) and job.label == trip.doing and not job.cancel.is_set():
+            # Gemini Live re-issues the running trip's call (seen for "where are you?"); restarting would lose it.
+            return f"Already {trip.doing}; not restarted. {self.jobs.where.describe()}"
+        result = await self.jobs.dispatch(trip.doing, lambda r: go_to(r, self.jobs.vision, trip, self.jobs.where))
+        return f"{result} I assume I start from {trip.start}." if result.startswith("Started") else result
+
+    @function_tool()
+    async def where_am_i(self) -> str:
+        """Your best guess of where you are in the house, and how sure you are. Does not move."""
+        return self.jobs.where.describe()
+
+    @function_tool()
+    async def set_home(self, room: str = "") -> str:
+        """Remember the spot you are on as home, when the owner says this is home.
+
+        Unless you just arrived here with go_to, you look around and turn once on the spot to find where you are.
+
+        Args:
+            room: the room you are in, if the owner said it. Needed unless you just arrived here with go_to.
+        """
+        if pose := self.jobs.where.start_pose():
+            try:
+                await asyncio.to_thread(navigation.save_home, pose)
+            except ValueError as e:
+                return f"I did not save home: {e}."
+            return f"Saved: this spot is home now, in {navigation.room_name(pose)}."
+        if not room:
+            return "I'm not sure exactly where I am. Tell me which room I'm in, and I'll look around to find my spot."
+        try:
+            name, _, area = navigation.find_place(room)
+        except navigation.UnknownPlace as e:
+            return str(e)
+        if name == "home":
+            return "Tell me which room this is, for example the kitchen."
+        return await self.jobs.dispatch(
+            "finding my spot for home", lambda r: set_home(r, self.jobs.vision, name, area, self.jobs.where),
+            background=False,
         )
 
     @function_tool()

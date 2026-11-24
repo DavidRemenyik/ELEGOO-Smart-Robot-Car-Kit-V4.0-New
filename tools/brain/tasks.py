@@ -14,11 +14,13 @@ from pathlib import Path
 from statistics import median
 from threading import Event, Thread
 
+import numpy as np
 from google import genai
 from google.genai import errors, types
 from livekit.agents import ToolError
 from pydantic import BaseModel, Field, ValidationError
 
+import navigation
 from dashboard import Recorder
 from drive import MOVE_LIMIT, NO_FLOOR, STALL_BACK_CM, STALLED, Driver, StallWatch, _speed, distance_at
 from vision import Person, Vision, person_box
@@ -40,8 +42,11 @@ def clamp(x: float, lo: float, hi: float) -> float:
 class SafeDrive:
     """Wrap the existing recorder without changing Driver or the wire protocol."""
 
-    def __init__(self, robot: Recorder, reason: Callable[[], str | None], vision: Vision | None = None):
+    def __init__(self, robot: Recorder, reason: Callable[[], str | None], vision: Vision | None = None,
+                 where: navigation.Whereabouts | None = None):
         self.robot, self.reason = robot, reason
+        self.where = where
+        self.navigating = False  # go_to tracks its own position; any other wheel command makes it stale
         self.head_angle = 90
         self.last_floor = 0.0
         self._pwm = (0.0, 0.0)
@@ -88,6 +93,8 @@ class SafeDrive:
         status = self.robot.wheels(left, right)
         if left or right:
             self._check_floor(status[1])
+            if self.where and not self.navigating:
+                self.where.moved()
         if self.stall.wheels(left, right, status[0], self.head_angle):
             self.distance_driven = distance_at(self._odometer, self.stall.still_since)
         return status
@@ -441,6 +448,101 @@ def find_object(r: SafeDrive, vision: Vision, query: Callable[[bytes], Awaitable
     return f"I couldn't find {name} in the views I checked. I stopped."
 
 
+def _first_depth(r: SafeDrive, feed: navigation.DepthFeed) -> str | None:
+    """Wait for the first depth picture (the Mac loads the depth model on the first trip); the problem, or None."""
+    until = time.monotonic() + navigation.FIRST_DEPTH_S
+    while not feed.ready():
+        if feed.problem:
+            return feed.problem
+        if time.monotonic() > until:
+            return "no depth picture from my camera"
+        r.wait(0.05)
+    return None
+
+
+def go_to(r: SafeDrive, vision: Vision, trip: navigation.Trip, where: navigation.Whereabouts) -> str:
+    """Drive to a named place on the navigator, 10 steps a second, and say honestly how it ended."""
+    nav = trip.navigator
+    feed = navigation.DepthFeed(vision)
+    stalls, seen = 0, len(r.stall.events)
+    stamps: list[float] = []
+    compute_ms: list[float] = []
+    send_ms: list[float] = []
+    late = 0
+    status = None
+    r.navigating = True
+    try:
+        if problem := _first_depth(r, feed):
+            return f"I did not start {trip.doing}: {problem}."
+        sensors = navigation.Sensors(r, feed)
+        due = time.monotonic()
+        while True:
+            stamps.append(time.monotonic())
+            left, right, head, status = nav.step(sensors.observe())
+            computed = time.monotonic()
+            compute_ms.append((computed - stamps[-1]) * 1000)
+            where.update(status.pose, status.confidence, trip.doing)
+            if status.state in ("arrived", "failed"):
+                break
+            sensors.send(left, right, head)
+            send_ms.append((time.monotonic() - computed) * 1000)
+            if len(r.stall.events) > seen:
+                seen = len(r.stall.events)
+                stalls += 1
+                if nav.state == "driving":
+                    # The sensors miss what the car pushes against: start the navigator's own stuck recovery
+                    # (back up, turn, block the spot ahead, replan) now instead of after 8 s without progress.
+                    nav._start_recovery()
+            due += navigation.DT
+            if (pause := due - time.monotonic()) > 0:
+                r.wait(pause)
+            else:
+                late += 1
+                if pause < -2 * navigation.DT:  # far behind: start counting afresh rather than rush
+                    due = time.monotonic()
+    finally:
+        feed.close()
+        r.navigating = False
+        where.settle(status is not None and status.state == "arrived")
+        periods = np.diff(stamps) if len(stamps) > 1 else np.zeros(1)
+        where.last_trip = dict(
+            state=status.state if status else "not started", reason=status.reason if status else "",
+            nav_s=status.t if status else 0.0, stalls=stalls, recoveries=nav.recoveries, late_steps=late,
+            steps=len(stamps), period_median_ms=float(np.median(periods) * 1000),
+            period_mean_ms=float(np.mean(periods) * 1000), period_p95_ms=float(np.percentile(periods, 95) * 1000),
+            compute_median_ms=float(np.median(compute_ms or [0])), send_median_ms=float(np.median(send_ms or [0])),
+            depth_ms=list(feed.ms), start=trip.start,
+        )
+    pushed = f" {stalls} times I was pushing against something and backed off." if stalls else ""
+    if status.state == "arrived":
+        return (f"I think I'm at {trip.there} now: my position estimate is within 30 cm of it, at "
+                f"{status.confidence:.0%} confidence, after {status.t:.0f} seconds.{pushed}")
+    why = {"lost": "I lost track of where I am", "blocked": "I couldn't find a way through",
+           "timeout": f"I ran out of time after {status.t:.0f} seconds"}[status.reason]
+    room = navigation.room_name(status.pose)
+    guess = (f"I think I'm in {room}" if status.confidence >= navigation.TRUST
+             else f"My best guess is {room}, but I'm not sure")
+    return f"I stopped without reaching {trip.there}: {why}. {guess}.{pushed}"
+
+
+def set_home(r: SafeDrive, vision: Vision, room: str, area: str, where: navigation.Whereabouts) -> str:
+    """Stand and look around until the localiser knows the spot in `area`, then save it as home."""
+    feed = navigation.DepthFeed(vision)
+    found = None
+    try:
+        if problem := _first_depth(r, feed):
+            return f"I did not save home: {problem}."
+        found = navigation.locate(r, feed, area, where)
+    finally:
+        feed.close()
+        where.settle(found is not None)
+    if found is None:
+        return f"I couldn't work out exactly where I am in the {room}, so home is unchanged."
+    h = navigation.save_home(found.pose)
+    return (f"Saved: this spot is home now, in {navigation.room_name(found.pose)} "
+            f"(about {h.x:.1f}, {h.y:.1f} on my map, confidence {found.confidence:.0%}).")
+
+
 @dataclass(slots=True)
 class Job:
     label: str
@@ -457,6 +559,7 @@ class TaskManager:
         self.car, self.vision, self.speak = car, vision, speak
         self.t = car.telemetry
         self.active: Job | None = None
+        self.where = navigation.Whereabouts(lambda: car.human_epoch)
         self.last = "No task has run yet."
         self._gate = asyncio.Lock()
         self._initiative_task: asyncio.Task[None] | None = None
@@ -534,7 +637,7 @@ class TaskManager:
             return self._blocked()
 
         def run(robot: Recorder) -> str:
-            r = SafeDrive(robot, reason, self.vision)
+            r = SafeDrive(robot, reason, self.vision, self.where)
             try:
                 r.check()
                 return fn(r)
